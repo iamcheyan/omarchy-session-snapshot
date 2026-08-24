@@ -1,12 +1,53 @@
 # Session Snapshot
 
+![Session Snapshot](screenshot.png)
+
 ## 0.1.1
 
 - Adapted the settings panel text, controls, borders, and hover states to
   Omarchy popup theme tokens for readable contrast across themes.
 
-`hancore.session-snapshot` adds a small Omarchy top-bar control for the
-desktop session snapshot engine already shipped by the shell.
+## About
+
+### English
+
+`hancore.session-snapshot` is designed for machines where system hibernation
+cannot be enabled. It saves the user's working session before logout,
+shutdown, reboot, or graphical-session exit, then restores it automatically at
+the next login. This provides a pseudo-hibernate experience so users can
+continue working where they left off.
+
+The saved state includes launchable application windows, Hyprland workspaces
+and positions, terminal directories, and detected tmux/zellij sessions. Kitty
+windows are restored one-to-one: every saved Kitty OS window keeps its own
+Kitty tabs/panes and its own workspace/position. The plugin never merges or
+deduplicates sibling Kitty windows. Process memory, unsaved buffers, and
+application-internal state cannot be preserved.
+
+### 中文
+
+`hancore.session-snapshot` 面向无法启用系统休眠的设备。在用户注销、关机、
+重启或图形会话退出时，插件会保存当前工作区状态；下次登录后自动恢复，
+从而模拟休眠效果，让用户可以继续之前未完成的工作。
+
+它会保存可启动的应用窗口、Hyprland 工作区及窗口位置、终端目录，以及检测到
+的 tmux/zellij 会话。Kitty 窗口会严格一对一恢复：每一个保存的 Kitty 操作系统
+窗口都会保留自己的 Kitty 标签页/面板以及对应的 Hyprland 工作区和位置。插件
+不会合并或去重 Kitty 窗口。进程内存、未保存的编辑内容和应用内部状态无法保存。
+
+### 日本語
+
+`hancore.session-snapshot` は、システムの休止状態を有効にできないマシン向けの
+プラグインです。ログアウト、シャットダウン、再起動、またはグラフィカルセッション
+の終了時に作業中のセッションを保存し、次回ログイン時に自動的に復元します。
+これにより、休止状態に近い環境を実現し、前回の作業を続きから再開できます。
+
+起動可能なアプリケーションウィンドウ、Hyprland のワークスペースとウィンドウ位置、
+ターミナルのディレクトリ、検出された tmux/zellij セッションを保存します。Kitty
+ウィンドウは一対一で復元されます。保存された各 Kitty OS ウィンドウは、それぞれの
+Kitty タブ/ペインと Hyprland のワークスペース/位置を保持します。Kitty ウィンドウを
+統合したり重複排除したりすることはありません。プロセスのメモリ、未保存のバッファ、
+アプリケーション内部の状態は保存できません。
 
 ## Install
 
@@ -29,13 +70,6 @@ Its menu follows the desktop state:
   also read by the shell power menu;
 - preserve the existing automatic next-login restore marker and teardown-safe
   rolling snapshot logic.
-
-This is a pseudo-hibernate feature. It restores launchable application windows,
-workspaces, terminal directories, and detected tmux/zellij sessions. Kitty
-windows are intentionally restored one-to-one: every saved Kitty OS window
-keeps its own Kitty tabs/panes and its own Hyprland workspace/position. The
-plugin never merges sibling Kitty windows. It does not
-preserve process memory, unsaved buffers, or application-internal state.
 
 The plugin contains its own session snapshot engine under `bin/` and does not
 depend on another shell checkout. Snapshot data is kept under
