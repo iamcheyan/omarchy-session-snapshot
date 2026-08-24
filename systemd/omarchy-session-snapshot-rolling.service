@@ -1,0 +1,7 @@
+[Unit]
+Description=Refresh the Omarchy desktop session snapshot
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.config/omarchy/plugins/omarchy-session-snapshot/bin/omarchy-session-snapshot save-rolling

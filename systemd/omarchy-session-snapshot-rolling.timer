@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically refresh the Omarchy desktop session snapshot
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=1min
+Unit=omarchy-session-snapshot-rolling.service
+
+[Install]
+WantedBy=graphical-session.target

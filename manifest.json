@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "hancore.session-snapshot",
+  "name": "Session Snapshot",
+  "version": "0.1.1",
+  "author": "HANCORE",
+  "license": "MIT",
+  "description": "A native Omarchy bar widget for saving, inspecting, and restoring desktop session snapshots.",
+  "keepLoaded": true,
+  "kinds": ["bar-widget", "service"],
+  "entryPoints": {
+    "barWidget": "bar/widget.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Session snapshot",
+    "description": "Save and restore your windows, workspaces, terminal directories, and multiplexer sessions.",
+    "category": "Desktop",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

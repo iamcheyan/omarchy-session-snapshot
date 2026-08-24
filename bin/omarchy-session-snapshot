@@ -1,0 +1,2247 @@
+#!/usr/bin/env python3
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ 
+
+
+_state_home = os.environ.get("OMARCHY_SESSION_SNAPSHOT_STATE_HOME") or os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "omarchy-session-snapshot")
+STATE_DIR = Path(_state_home) / "session"
+LAST_FILE = STATE_DIR / "last.json"
+LAST_BAK_FILE = STATE_DIR / "last.json.bak"
+RESTORE_RESULT_FILE = STATE_DIR / "restore-result.json"
+AUTO_RESTORE_FILE = STATE_DIR / "restore-on-next-start"
+SAVE_REQUESTED_FILE = STATE_DIR / "save-requested"
+RESTORE_LOCK = STATE_DIR / "restore.lock"
+KITTY_SESSION_DIR = STATE_DIR / "kitty"
+TERMINAL_CLASSES = ("kitty", "foot", "alacritty", "ghostty", "wezterm", "org.wezfurlong.wezterm")
+SHELL_NAMES = ("bash", "zsh", "fish", "nu", "sh")
+TERMINAL_HELPER_NAMES = (
+    "foot", "footclient", "kitty", "kitten", "alacritty", "ghostty", "wezterm",
+    "tmux", "zellij",
+)
+FIREFOX_CLASSES = ("firefox", "org.mozilla.firefox")
+FIREFOX_ENV_KEYS = (
+    "MOZ_ENABLE_WAYLAND",
+    "GDK_BACKEND",
+    "GDK_SCALE",
+    "GDK_DPI_SCALE",
+    "XCURSOR_SIZE",
+)
+
+# Applications that manage their own multi-window session via a single process
+# launch (like Firefox). The snapshot engine starts them once and matches the windows they
+# recreate back to saved records, instead of launching once per saved window
+# (which would duplicate the session).
+SINGLE_INSTANCE_CLASSES = FIREFOX_CLASSES + (
+    "org.kde.dolphin", "dolphin",
+    "org.kde.kwrite", "kwrite",
+    "org.kde.kate", "kate",
+)
+
+# Per-class restore timeout in seconds. Heavy applications (Firefox cold start,
+# Electron apps) can take much longer to register a Hyprland client than the
+# default 5 s. Falls back to the default for anything not listed.
+RESTORE_TIMEOUTS = {
+    "firefox": 30.0,
+    "org.mozilla.firefox": 30.0,
+    "org.kde.dolphin": 12.0,
+    "org.kde.kwrite": 10.0,
+    "org.kde.kate": 10.0,
+    "code": 15.0,
+    "code-url-handler": 15.0,
+}
+DEFAULT_RESTORE_TIMEOUT = 5.0
+# Flatpak apps cold-start through bwrap + runtime init, which is much slower
+# than a native launch. Give them a generous wait regardless of class.
+FLATPAK_RESTORE_TIMEOUT = 30.0
+
+
+def _hypr_available():
+    """True when we can actually talk to Hyprland. Guards every hyprctl
+    call so session restore degrades gracefully on other compositors
+    (labwc): launches still happen, workspace/monitor placement is a no-op,
+    and window verification is skipped instead of crashing."""
+    return bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")) and shutil.which("hyprctl") is not None
+
+
+def run_json(*args):
+    if not _hypr_available():
+        return {}
+    out = subprocess.check_output(args, text=True)
+    return json.loads(out)
+
+
+def hypr(*args):
+    if not _hypr_available():
+        return subprocess.CompletedProcess([], 0)
+    return subprocess.run(["hyprctl", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def hypr_lua(expr):
+    """Execute a Lua dispatch expression via hyprctl dispatch."""
+    if not _hypr_available():
+        return subprocess.CompletedProcess([], 0)
+    return subprocess.run(["hyprctl", "dispatch", expr], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def hypr_close_window(address):
+    # `closewindow address:...` can be unreliable for windows outside the
+    # currently active workspace. The Hyprland Lua helper expects `window`,
+    # not `address`; this matches the overview window-close path.
+    hypr_lua(f'hl.dsp.window.close({{ window = "address:{address}" }})')
+    if wait_until_client_gone(address, timeout=0.5):
+        return subprocess.CompletedProcess([], 0)
+
+    hypr_lua(f'hl.dsp.focus({{ window = "address:{address}" }})')
+    time.sleep(0.08)
+    if active_window_address() == address:
+        hypr_lua(f'hl.dsp.window.kill({{ window = "address:{address}" }})')
+    hypr_lua(f'hl.dsp.window.close({{ window = "address:{address}" }})')
+
+
+def active_window_address():
+    try:
+        return run_json("hyprctl", "-j", "activewindow").get("address", "")
+    except Exception:
+        return ""
+
+
+def current_focus_state(clients):
+    active_window = {}
+    active_workspace = {}
+    monitors = []
+    try:
+        active_window = run_json("hyprctl", "-j", "activewindow")
+    except Exception:
+        pass
+    try:
+        active_workspace = run_json("hyprctl", "-j", "activeworkspace")
+    except Exception:
+        pass
+    try:
+        monitors = run_json("hyprctl", "-j", "monitors")
+    except Exception:
+        pass
+
+    active_address = active_window.get("address", "")
+    focused_record = next((client for client in clients if client.get("address") == active_address), None)
+    if not focused_record and clients:
+        focused_record = sorted(clients, key=lambda c: c.get("focusHistoryID", 999999))[0]
+
+    return {
+        "activeAddress": active_address,
+        "activeWorkspace": active_workspace,
+        "focusedMonitor": active_window.get("monitor", -1),
+        "focusedRecord": {
+            "address": focused_record.get("address", "") if focused_record else "",
+            "class": focused_record.get("class", "") if focused_record else "",
+            "title": focused_record.get("title", "") if focused_record else "",
+            "workspace": focused_record.get("workspace", {}) if focused_record else {},
+            "monitor": focused_record.get("monitor", -1) if focused_record else -1,
+            "focusHistoryID": focused_record.get("focusHistoryID", 999999) if focused_record else 999999,
+        },
+        "monitorWorkspaces": [
+            {
+                "id": monitor.get("id", -1),
+                "name": monitor.get("name", ""),
+                "activeWorkspace": monitor.get("activeWorkspace", {}),
+            }
+            for monitor in monitors
+        ],
+    }
+
+
+def hypr_focus_workspace(wsid, name=None):
+    """Switch the active monitor to the given workspace. Unified with
+    focus_workspace_id — both use the Omarchy Lua dispatch syntax."""
+    if isinstance(wsid, int) and wsid < 0:
+        # Special workspace. `hyprctl dispatch toggpecialworkspace` (native
+        # form) is a Lua syntax error on Hyprland 0.55+ — and toggling
+        # without a name would toggle the WRONG special workspace.
+        ws_name = name or f"special:{abs(wsid)}"
+        hypr_lua(f'hl.dsp.workspace.toggle_special({{ name = "{ws_name}" }})')
+        time.sleep(0.08)
+        return subprocess.CompletedProcess([], 0)
+    if wsid:
+        hypr_lua(f'hl.dsp.focus({{ workspace = "{wsid}" }})')
+        time.sleep(0.08)
+    return subprocess.CompletedProcess([], 0)
+
+
+def hypr_clients_by_address():
+    try:
+        return {
+            client.get("address"): client
+            for client in run_json("hyprctl", "-j", "clients")
+            if client.get("address")
+        }
+    except Exception:
+        return {}
+
+
+def wait_until_client_gone(address, timeout=1.2):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if address not in hypr_clients_by_address():
+            return True
+        time.sleep(0.08)
+    return address not in hypr_clients_by_address()
+
+
+def proc_cmdline(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode(errors="ignore") for part in raw.split(b"\0") if part]
+
+
+def proc_environment(pid, allowed_keys):
+    """Read only explicitly allowed, non-sensitive environment keys."""
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return {}
+    allowed = set(allowed_keys)
+    result = {}
+    for entry in raw.split(b"\0"):
+        if b"=" not in entry:
+            continue
+        key_raw, value_raw = entry.split(b"=", 1)
+        key = key_raw.decode(errors="ignore")
+        if key in allowed:
+            result[key] = value_raw.decode(errors="ignore")
+    return result
+
+
+def proc_cwd(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
+
+
+def proc_name(pid):
+    argv = proc_cmdline(pid)
+    if argv:
+        return Path(argv[0]).name
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return ""
+
+
+def flatpak_app_id(pid):
+    """Return the Flatpak application ID for a process, or "" if not Flatpak.
+
+    Flatpak mounts a .flatpak-info file at the root of every sandboxed
+    process. Its [Application] section has a name= line carrying the app ID
+    (e.g. com.tencent.WeChat). Reading /proc/PID/root/.flatpak-info works from
+    the host because the process root is the sandbox mount, not the host /.
+    Non-Flatpak processes have no such file, so detection is reliable and
+    side-effect free. The app ID is the host-launchable handle: restore uses
+    `flatpak run <app-id>` instead of the sandbox-internal argv.
+    """
+    try:
+        info = Path(f"/proc/{pid}/root/.flatpak-info").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    for line in info.splitlines():
+        if line.startswith("name="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def parse_option(argv, name):
+    for index, arg in enumerate(argv):
+        if arg == name and index + 1 < len(argv):
+            return argv[index + 1]
+        if arg.startswith(f"{name}="):
+            return arg.split("=", 1)[1]
+    return ""
+
+
+def process_tree():
+    children = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            stat = (entry / "stat").read_text()
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+        except Exception:
+            continue
+        children.setdefault(ppid, []).append(pid)
+    return children
+
+
+def descendants(pid, children):
+    stack = [(pid, 0)]
+    result = []
+    while stack:
+        current, depth = stack.pop()
+        for child in children.get(current, []):
+            result.append((child, depth + 1))
+            stack.append((child, depth + 1))
+    return result
+
+
+def parse_tmux_session(argv):
+    # Accept both attach commands and new-session/new -A (attach-or-create),
+    # since `tmux new-session -A -s NAME` attaches to an existing session and
+    # is the common pattern used inside terminal windows.
+    attach_commands = ("attach", "attach-session", "a", "new-session", "new")
+    command_index = next((i for i, arg in enumerate(argv) if arg in attach_commands), -1)
+    if command_index < 0:
+        return None
+    name = ""
+    args = argv[command_index + 1:]
+    for index, arg in enumerate(args):
+        if arg in ("-t", "--target") and index + 1 < len(args):
+            name = args[index + 1]
+            break
+        if arg.startswith("-t="):
+            name = arg.split("=", 1)[1]
+            break
+        if arg in ("-s", "--session") and index + 1 < len(args):
+            name = args[index + 1]
+            break
+        if arg.startswith("-s="):
+            name = arg.split("=", 1)[1]
+            break
+        if not arg.startswith("-"):
+            name = arg
+            break
+    command = argv[command_index]
+    return {
+        "type": "tmux",
+        "name": name,
+        "argvPrefix": argv[:command_index],
+        # Preserve attach-or-create semantics. After a reboot there is no tmux
+        # server to attach to; `new-session -A` starts it, which also lets
+        # tmux-continuum restore the latest tmux-resurrect snapshot.
+        "attachOrCreate": command in ("new-session", "new") and "-A" in argv,
+    }
+
+
+def parse_zellij_session(argv):
+    command_index = next((i for i, arg in enumerate(argv) if arg == "attach"), -1)
+    if command_index < 0:
+        return None
+    name = ""
+    for arg in argv[command_index + 1:]:
+        if not arg.startswith("-"):
+            name = arg
+            break
+    return {
+        "type": "zellij",
+        "name": name,
+        "argvPrefix": argv[:command_index],
+    }
+
+
+def terminal_session_info(pid):
+    children = process_tree()
+    candidates = []
+    for child, depth in descendants(pid, children):
+        argv = proc_cmdline(child)
+        if not argv:
+            continue
+        name = Path(argv[0]).name.lower()
+        info = None
+        if name == "tmux":
+            info = parse_tmux_session(argv)
+        elif name == "zellij":
+            info = parse_zellij_session(argv)
+        if info:
+            info["pid"] = child
+            info["depth"] = depth
+            candidates.append(info)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item.get("depth", 999999))
+    return candidates[0]
+
+
+def terminal_program_info(pid):
+    children = process_tree()
+    candidates = []
+    for child, depth in descendants(pid, children):
+        argv = proc_cmdline(child)
+        if not argv:
+            continue
+        name = Path(argv[0]).name.lower()
+        if name in SHELL_NAMES or name in TERMINAL_HELPER_NAMES:
+            continue
+        cwd = proc_cwd(child) or proc_cwd(pid)
+        candidates.append({
+            "pid": child,
+            "depth": depth,
+            "name": name,
+            "argv": argv,
+            "cwd": cwd,
+        })
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item.get("depth", 0), reverse=True)
+    return candidates[0]
+
+
+def kitty_listen_on(argv):
+    """Resolve the kitty remote-control socket address.
+
+    Kitty accepts --listen-on on the command line, but it is more commonly
+    set in kitty.conf (listen_on). In that case the socket path is not in
+    argv, but kitty exports KITTY_LISTEN_ON into the environment of every
+    child window it spawns. We read that from the first descendant that has
+    it, falling back to argv.
+    """
+    return parse_option(argv, "--listen-on")
+
+
+def kitty_resolve_socket(pid, argv):
+    """Find the kitty @ --to socket for a running kitty instance."""
+    explicit = kitty_listen_on(argv)
+    if explicit:
+        return explicit
+    # kitty.conf's listen_on is not in argv. kitty sets KITTY_LISTEN_ON in
+    # every child window's environment with the resolved socket path (which
+    # kitty suffixes with its PID for unix sockets). Scan descendants.
+    children = process_tree()
+    for child, _depth in descendants(pid, children):
+        try:
+            raw = Path(f"/proc/{child}/environ").read_bytes()
+        except OSError:
+            continue
+        for entry in raw.split(b"\0"):
+            if entry.startswith(b"KITTY_LISTEN_ON="):
+                return entry.split(b"=", 1)[1].decode(errors="ignore")
+    return ""
+
+
+def kitty_session_windows(session):
+    """Return (os_window_index, tab_index, window) triples from the captured
+    kitty JSON, in tree order. The JSON must be captured unfiltered: a
+    `--match pid:` filter would hide every pane but the first, dropping the
+    other panes' multiplexer sessions from the snapshot."""
+    if not session or session.get("type") != "kitty":
+        return []
+    raw = session.get("json") or ""
+    if not raw.strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    result = []
+    for os_index, os_window in enumerate(data):
+        for tab_index, tab in enumerate(os_window.get("tabs", [])):
+            for window in tab.get("windows", []):
+                result.append((os_index, tab_index, window))
+    return result
+
+
+def kitty_session_block(content, os_window_index):
+    """Extract one OS-window block from Kitty's multi-window session text."""
+    lines = (content or "").splitlines()
+    blocks = [[]]
+    for line in lines:
+        if line.strip() == "new_os_window":
+            blocks.append([])
+        else:
+            blocks[-1].append(line)
+    if 0 <= os_window_index < len(blocks):
+        block = "\n".join(blocks[os_window_index]).strip()
+        return block + "\n" if block else ""
+    return ""
+
+
+def kitty_os_window_index(data, client):
+    """Match one Kitty OS window to the corresponding Hyprland client.
+
+    A Kitty server can own several OS windows. Matching by the current
+    window title keeps those windows independent in the compositor snapshot;
+    unlike Kitty's cold-start helper, the plugin must not flatten them.
+    """
+    target = " ".join(str(client.get(key, "")) for key in ("title", "initialTitle"))
+    target = target.strip().lower()
+    if not target or not isinstance(data, list):
+        return 0 if data else None
+    best = None
+    for index, os_window in enumerate(data):
+        values = [os_window.get("title", ""), os_window.get("wm_name", "")]
+        for tab in os_window.get("tabs", []):
+            values.append(tab.get("title", ""))
+            values.extend(window.get("title", "") for window in tab.get("windows", []))
+        haystack = " ".join(str(value) for value in values).lower()
+        score = 2 if target == haystack else 1 if target and target in haystack else 0
+        if score and (best is None or score > best[0]):
+            best = (score, index)
+    return best[1] if best else 0
+
+
+def kitty_window_attach(window):
+    """Return a tmux/zellij attach argv for one kitty pane, or None.
+
+    Kitty reports the command a pane's shell is currently running via
+    last_reported_cmdline; a tmux client running `tmux new-session -A -s X`
+    reports exactly that, so it survives the shell between the client and
+    kitty. Fall back to the process cmdline when the reported line is empty.
+    A bare `tmux new-session -A` without a session name cannot be restored
+    headlessly (tmux refuses to open a terminal), so it degrades to a plain
+    shell instead of replaying a broken command.
+    When neither source names a multiplexer, scan the pane's descendants via
+    the window pid from kitty's ls JSON. Shell integration can be absent
+    entirely (KITTY_SHELL_INTEGRATION=no-rc on NixOS, or panes whose shells
+    predate the zshrc integration loader) — without this scan their tmux
+    sessions silently degrade to bare shells on restore."""
+    reported = (window.get("last_reported_cmdline") or "").strip()
+    reported_argv = reported.split() if reported else []
+    candidates = [window.get("cmdline") or [], reported_argv]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        name = Path(candidate[0]).name.lower()
+        info = None
+        if name == "tmux":
+            info = parse_tmux_session(candidate)
+            if info:
+                info["argvPrefix"] = ["tmux"]
+        elif name == "zellij":
+            info = parse_zellij_session(candidate)
+            if info:
+                info["argvPrefix"] = ["zellij"]
+        if not info:
+            continue
+        if info.get("type") == "tmux" and not info.get("name"):
+            return None
+        return terminal_attach_command(info)
+    pid = window.get("pid")
+    if pid:
+        info = terminal_session_info(int(pid))
+        if info and not (info.get("type") == "tmux" and not info.get("name")):
+            return terminal_attach_command(info)
+    return None
+
+def kitty_pane_command(window):
+    """Return an argv that re-runs one kitty pane's actual command, or None.
+
+    kitty reports the command a pane's foreground shell is running via
+    last_reported_cmdline (e.g. `cd /tmp/x && dotnet ServerCore.dll`); the
+    pane's own shell is in cmdline (e.g. /usr/bin/zsh). When there is a
+    reported command we replay it through that shell so `&&`, pipes, and
+    other shell syntax work, then `exec` into a fresh interactive shell so
+    the pane stays open after the command exits (matching the original
+    interactive-shell behavior). When the pane was just an idle shell we
+    start a fresh interactive shell. tmux/zellij panes are handled by
+    kitty_window_attach and must not be replayed here."""
+    attach = kitty_window_attach(window)
+    if attach:
+        return None
+    shell_argv = window.get("cmdline") or []
+    shell = shell_argv[0] if shell_argv else os.environ.get("SHELL") or "sh"
+    reported = (window.get("last_reported_cmdline") or "").strip()
+    if not reported:
+        return [shell]
+    # Run the command, then replace the process with a fresh interactive
+    # shell so the pane survives the command exiting.
+    return [shell, "-c", reported + "; exec " + shell]
+def synthesize_kitty_session(session):
+    """Build a kitty session file that re-runs every pane's command.
+
+    For each pane we emit one `launch` directive: a tmux/zellij attach when
+    the pane ran a multiplexer (preserving the painting's own session), or a
+    replay of the pane's last command via its shell (`<shell> -c
+    <last_reported_cmdline>; exec <shell>`) so `cd ... && dotnet run` style
+    panes come back instead of empty shells and the pane stays open after
+    the command exits. Panes that were idle shells start a fresh interactive
+    shell. When the JSON panes carry no replayable command at all (and the
+    layout dump is richer), the layout dump is kept as the higher-fidelity
+    fallback.
+    """
+    windows = kitty_session_windows(session)
+    # JSON may hold fewer windows than the layout-only dump (old snapshots
+    # captured with a --match pid: filter, or closed tabs lingering in kitty's
+    # tab history that ls omits). When the JSON panes carry no replayable
+    # command, the layout dump is still the higher-fidelity restore (it
+    # rebuilds pane geometry), so fall back to it. But when the JSON panes
+    # *do* carry a command (last_reported_cmdline / multiplexer attach),
+    # re-running it matters more than the geometry of closed tabs, so we
+    # synthesize from the JSON and accept that extra layout-only windows are
+    # not recreated.
+    content = session.get("content") or ""
+    commands = [kitty_pane_command(window) for _, _, window in windows]
+    if content.strip() and len(windows) < content.count("launch") and not any(commands):
+        return content
+    attaches = [kitty_window_attach(window) for _, _, window in windows]
+    commands = [
+        (attach or kitty_pane_command(window))
+        for attach, (_, _, window) in zip(attaches, windows)
+    ]
+    if not any(commands):
+        return content if content.strip() else ""
+    prev_os = None
+    prev_tab = None
+    lines = []
+    for (os_index, tab_index, _window), command in zip(windows, commands):
+        if prev_os is not None:
+            if os_index != prev_os:
+                lines.append("new_os_window")
+            elif tab_index != prev_tab:
+                lines.append("new_tab")
+        prev_os, prev_tab = os_index, tab_index
+        if not command:
+            lines.append("launch")
+            continue
+        parts = ["launch"]
+        cwd = (_window.get("cwd") or "")
+        if cwd:
+            parts += ["--cwd", cwd]
+        parts += command
+        lines.append(" ".join(shlex.quote(part) for part in parts))
+    return "\n".join(lines) + "\n"
+
+
+def kitty_restore_session(session):
+    """Return Kitty's own session program whenever it was captured.
+
+    ``kitty @ ls --output-format=session`` is not just a convenient text
+    export: it contains Kitty's private ``kitty-unserialize-data`` records,
+    layout state, tab focus, titles, and the exact launch arguments. Reusing
+    it is the only way to retain the same fidelity as Kitty's built-in
+    ``save_as_session`` action. The synthesized writer remains a compatibility
+    fallback for snapshots made by older plugin versions or for Kitty builds
+    that cannot export a session.
+    """
+    session = session or {}
+    index = session.get("osWindowIndex", 0)
+    content = kitty_session_block(session.get("content", ""), index)
+    if not content and index == 0:
+        content = session.get("content") or ""
+    if content.strip() and "launch" in content:
+        return content if content.endswith("\n") else content + "\n"
+    # If the official text cannot be split (old Kitty output), still restrict
+    # the compatibility synthesis to this one OS window.
+    try:
+        tree = json.loads(session.get("json") or "[]")
+        filtered = dict(session)
+        filtered["json"] = json.dumps([tree[index]]) if tree[index:index + 1] else "[]"
+    except (TypeError, ValueError, IndexError):
+        filtered = session
+    return synthesize_kitty_session(filtered)
+
+
+def kitty_session_info(pid, argv, client):
+    socket = kitty_resolve_socket(pid, argv)
+    if not socket:
+        return None
+    # Capture the full JSON tree (per-window cmdline, cwd,
+    # last_reported_cmdline) so restore can relaunch each pane's actual
+    # command (e.g. `tmux new-session -A -s <painting>`). The JSON must NOT
+    # be filtered with `--match pid:` — a filter would hide every pane but
+    # the first, dropping the other panes' tmux/zellij sessions from the
+    # snapshot and collapsing a multi-painting window to one painting on
+    # restore. The session-format export drops the child command, so it is
+    # only a layout/cwd fallback.
+    json_command = ["kitty", "@", "--to", socket, "ls"]
+    session_command = ["kitty", "@", "--to", socket, "ls", "--output-format=session"]
+    KITTY_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    official_path = KITTY_SESSION_DIR / f"capture-{pid}.session"
+    official_command = [
+        "kitty", "@", "--to", socket, "action", "save_as_session",
+        "--save-only", "--use-foreground-process", str(official_path),
+    ]
+    try:
+        json_result = subprocess.run(json_command, text=True, capture_output=True, timeout=1.5)
+        official_result = subprocess.run(official_command, text=True, capture_output=True, timeout=2.5)
+        if official_result.returncode == 0 and official_path.is_file():
+            session_content = official_path.read_text(encoding="utf-8")
+            try:
+                official_path.unlink()
+            except OSError:
+                pass
+        else:
+            session_result = subprocess.run(session_command, text=True, capture_output=True, timeout=1.5)
+            session_content = session_result.stdout if session_result.returncode == 0 else ""
+    except Exception:
+        return None
+    if json_result.returncode != 0 or not json_result.stdout.strip():
+        return None
+    try:
+        tree = json.loads(json_result.stdout)
+    except (TypeError, ValueError):
+        tree = []
+    return {
+        "type": "kitty",
+        "listenOn": socket,
+        "json": json_result.stdout,
+        "content": session_content,
+        "osWindowIndex": kitty_os_window_index(tree, client),
+    }
+
+
+def best_terminal_cwd(pid):
+    base = proc_cwd(pid)
+    children = process_tree()
+    candidates = []
+    for child, depth in descendants(pid, children):
+        cwd = proc_cwd(child)
+        if not cwd:
+            continue
+        name = proc_name(child)
+        score = depth
+        if name in SHELL_NAMES:
+            score += 100
+        candidates.append((score, cwd))
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+    return base
+
+
+def is_terminal(client):
+    values = [
+        client.get("class", ""),
+        client.get("initialClass", ""),
+        proc_name(client.get("pid", 0)),
+    ]
+    blob = " ".join(values).lower()
+    return any(token in blob for token in TERMINAL_CLASSES)
+
+
+def window_class(record):
+    return (record.get("initialClass") or record.get("class") or "").lower()
+
+
+def is_firefox(record):
+    cls = window_class(record)
+    return cls in FIREFOX_CLASSES or cls.endswith(".firefox")
+
+
+def is_single_instance(record):
+    cls = window_class(record)
+    return cls in SINGLE_INSTANCE_CLASSES or any(
+        cls == c or cls.endswith("." + c) for c in SINGLE_INSTANCE_CLASSES
+    )
+
+
+def restore_timeout_for(record):
+    """Return the wait_for_client timeout appropriate for this record's class."""
+    command = record.get("command") or {}
+    if command.get("flatpakAppId") or record.get("flatpakAppId"):
+        return FLATPAK_RESTORE_TIMEOUT
+    cls = window_class(record)
+    return RESTORE_TIMEOUTS.get(cls, DEFAULT_RESTORE_TIMEOUT)
+
+
+def terminal_attach_command(session):
+    if not session:
+        return []
+    prefix = session.get("argvPrefix") or [session.get("type")]
+    if not prefix:
+        prefix = [session.get("type")]
+    session_type = session.get("type")
+    name = session.get("name", "")
+    if session_type == "tmux":
+        if session.get("attachOrCreate"):
+            return [*prefix, "new-session", "-A", "-s", name] if name else [*prefix, "new-session", "-A"]
+        return [*prefix, "attach-session", "-t", name] if name else [*prefix, "attach"]
+    if session_type == "zellij":
+        return [*prefix, "attach", name] if name else [*prefix, "attach"]
+    return []
+
+
+def terminal_launch_argv(executable, terminal, cwd, session, program=None):
+    session_command = terminal_attach_command(session)
+    program_command = (program or {}).get("argv") or []
+    program_cwd = (program or {}).get("cwd") or cwd
+
+    if not session_command and not program_command:
+        if cwd:
+            if terminal == "foot":
+                return [executable, "--working-directory", cwd]
+            if terminal == "kitty":
+                return [executable, "--directory", cwd]
+            if terminal == "alacritty":
+                return [executable, "--working-directory", cwd]
+            if terminal == "ghostty":
+                return [executable, f"--working-directory={cwd}"]
+            if "wezterm" in terminal:
+                return [executable, "start", "--cwd", cwd]
+        return [executable]
+
+    child_command = session_command or program_command
+    child_cwd = cwd if session_command else program_cwd
+
+    if terminal == "kitty":
+        argv = [executable]
+        if child_cwd:
+            argv += ["--directory", child_cwd]
+        return [*argv, *child_command]
+    if terminal == "alacritty":
+        argv = [executable]
+        if child_cwd:
+            argv += ["--working-directory", child_cwd]
+        return [*argv, "-e", *child_command]
+    if terminal == "foot":
+        argv = [executable]
+        if child_cwd:
+            argv += ["--working-directory", child_cwd]
+        return [*argv, *child_command]
+    if terminal == "ghostty":
+        argv = [executable]
+        if child_cwd:
+            argv.append(f"--working-directory={child_cwd}")
+        return [*argv, "-e", *child_command]
+    if "wezterm" in terminal:
+        argv = [executable, "start"]
+        if child_cwd:
+            argv += ["--cwd", child_cwd]
+        return [*argv, "--", *child_command]
+    return [executable, *child_command]
+
+
+def restore_record_argv(record):
+    """Return a launch argv, upgrading old kitty snapshot records.
+
+    Kitty windows restore through a per-OS-window session file. New snapshots
+    use Kitty's exported session text; old snapshots may
+    hold a flattened launch — a single `tmux attach-session` rewrite, or a
+    plain kitty argv without the session placeholder. Re-pointing them at
+    the session-file path lets the file writer recover per-pane multiplexers
+    from the captured kitty JSON, so already-saved snapshots restore the
+    same way as new ones.
+    """
+    command = record.get("command") or {}
+    argv = command.get("argv") or []
+    # Flatpak apps store a sandbox-internal argv (e.g. /app/extra/wechat/wechat)
+    # that does not exist on the host. Launch through `flatpak run <app-id>`
+    # instead, which works for both fresh start and reactivating a running
+    # instance (flatpak run forwards to the existing app, no duplicate).
+    flatpak_id = command.get("flatpakAppId") or record.get("flatpakAppId") or ""
+    if flatpak_id:
+        return ["flatpak", "run", flatpak_id]
+    session = command.get("session") or {}
+    if not argv or not command.get("terminal") or session.get("type") != "kitty":
+        return argv
+
+    executable = argv[0]
+    return [executable, "--session", "__OMARCHY_KITTY_SESSION__"]
+
+
+def launch_command(client):
+    pid = int(client.get("pid") or 0)
+    argv = proc_cmdline(pid)
+    flatpak_id = flatpak_app_id(pid)
+    if not argv:
+        cls = client.get("initialClass") or client.get("class") or ""
+        if cls:
+            exe = shutil.which(cls) or shutil.which(cls.split("-")[0])
+            if exe:
+                argv = [exe]
+    if not argv:
+        cls = client.get("initialClass") or client.get("class") or ""
+        argv = [cls] if cls else []
+
+    cwd = best_terminal_cwd(pid) if is_terminal(client) else proc_cwd(pid)
+    terminal = Path(argv[0]).name.lower() if argv else ""
+    session = None
+    program = None
+    if is_terminal(client):
+        if terminal == "kitty":
+            session = kitty_session_info(pid, argv, client)
+        if not session:
+            session = terminal_session_info(pid)
+        if not session:
+            program = terminal_program_info(pid)
+
+    if is_terminal(client) and argv:
+        if session and session.get("type") == "kitty":
+            # Each Hyprland Kitty client gets its own OS-window session file.
+            # Never restore the whole Kitty server session here: that would
+            # merge sibling Kitty windows and break one-to-one workspace
+            # placement.
+            argv = [argv[0], "--session", "__OMARCHY_KITTY_SESSION__"]
+        else:
+            argv = terminal_launch_argv(argv[0], terminal, cwd, session, program)
+
+    environment = proc_environment(pid, FIREFOX_ENV_KEYS) if is_firefox(client) else {}
+
+    return {
+        "argv": argv,
+        "cwd": cwd,
+        "terminal": is_terminal(client),
+        "session": session,
+        "program": program,
+        "environment": environment,
+        "flatpakAppId": flatpak_id,
+    }
+
+
+class CompositorGone(RuntimeError):
+    """Hyprland should be reachable (env signature + hyprctl present) but its
+    IPC socket no longer answers. This is the teardown race: logind kills the
+    session scope (and with it the compositor) before the user manager runs
+    ExecStop, so any snapshot taken there must not crash the save path."""
+
+
+def _atomic_write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp_name = tmp.name
+            json.dump(data, tmp, ensure_ascii=False, indent=2)
+        os.replace(tmp_name, path)
+    except Exception:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+        raise
+
+
+
+def _notify(summary, body):
+    # notify-send is cosmetic; a missing binary must never abort a save that
+    # has already reached (or is about to reach) disk.
+    try:
+        subprocess.run(
+            ["notify-send", summary, body, "-a", "Session", "-i", "archive"],
+            stderr=subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def snapshot_clients():
+    try:
+        clients = run_json("hyprctl", "-j", "clients")
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as e:
+        # One short retry covers a transiently busy socket; a second failure
+        # with the env signature present means the compositor is gone.
+        time.sleep(0.5)
+        try:
+            clients = run_json("hyprctl", "-j", "clients")
+        except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
+            raise CompositorGone(f"hyprctl -j clients failed: {e}") from e
+    # Build monitor index -> name mapping so we can record which monitor
+    # each workspace belonged to at snapshot time.
+    try:
+        monitors = run_json("hyprctl", "-j", "monitors")
+        monitor_names = {m.get("id", -1): m.get("name", "") for m in monitors}
+        monitor_origins = {m.get("id", -1): (m.get("x", 0), m.get("y", 0)) for m in monitors}
+    except Exception:
+        monitor_names = {}
+        monitor_origins = {}
+    snapshot = []
+    for client in clients:
+        # Keep every mapped client from every monitor/workspace. Hyprland can
+        # mark windows outside the focused monitor/workspace as hidden, but
+        # those are still part of the desktop session and must be restored.
+        if not client.get("mapped", True):
+            continue
+        workspace = client.get("workspace") or {}
+        wsid = workspace.get("id", 0)
+        # Include special workspaces (negative id) so they restore too.
+        command = launch_command(client)
+        if not command["argv"]:
+            continue
+        mon_id = client.get("monitor", -1)
+        mon_origin = monitor_origins.get(mon_id, (0, 0))
+        abs_at = client.get("at", [0, 0])
+        snapshot.append({
+            "address": client.get("address", ""),
+            "class": client.get("class", ""),
+            "initialClass": client.get("initialClass", ""),
+            "title": client.get("title", ""),
+            "initialTitle": client.get("initialTitle", ""),
+            "pid": client.get("pid", 0),
+            "workspace": workspace,
+            "monitor": mon_id,
+            "monitorName": monitor_names.get(mon_id, ""),
+            "at": abs_at,
+            "atRelative": [
+                abs_at[0] - mon_origin[0] if len(abs_at) > 0 else 0,
+                abs_at[1] - mon_origin[1] if len(abs_at) > 1 else 0,
+            ],
+            "size": client.get("size", [0, 0]),
+            "floating": bool(client.get("floating")),
+            "fullscreen": int(client.get("fullscreen") or 0),
+            "focusHistoryID": client.get("focusHistoryID", 999999),
+            "command": command,
+        })
+    snapshot.sort(key=lambda c: (c.get("workspace", {}).get("id", 0), c.get("focusHistoryID", 999999)))
+    return snapshot
+
+def _existing_client_count():
+    """Return the client count of a valid existing last.json, or 0."""
+    try:
+        data = json.loads(LAST_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    if isinstance(data, dict):
+        return len(data.get("clients") or [])
+    return 0
+
+
+def save():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    clients = snapshot_clients()
+    if not clients:
+        print(json.dumps({
+            "saved": False,
+            "skipped": True,
+            "reason": "empty",
+            "count": 0,
+            "path": str(LAST_FILE),
+        }))
+        _notify("Session saved (empty)", "No windows to save — nothing was written")
+        return None
+
+    data = {
+        "version": 1,
+        "savedAt": int(time.time()),
+        "focus": current_focus_state(clients),
+        "clients": clients,
+    }
+    # If the existing last.json has many more clients than this capture, the
+    # compositor was likely already tearing down (windows closing) when we
+    # captured. Keep the richer existing snapshot as last.json so restore has
+    # the full desktop; back it up and still return the new data so save_auto
+    # can arm the marker against it. The marker's savedAt points at the
+    # existing snapshot, matching what restore will actually load.
+    existing_count = _existing_client_count()
+    if existing_count and len(clients) < existing_count * 0.5:
+        try:
+            shutil.copy2(LAST_FILE, LAST_BAK_FILE)
+        except Exception:
+            pass
+        data["savedAt"] = json.loads(LAST_FILE.read_text(encoding="utf-8")).get("savedAt", data["savedAt"])
+    else:
+        if LAST_FILE.exists():
+            try:
+                shutil.copy2(LAST_FILE, LAST_BAK_FILE)
+            except Exception:
+                pass
+        _atomic_write_json(LAST_FILE, data)
+    workspace_keys = {
+        (
+            client.get("monitorName") or str(client.get("monitor", -1)),
+            (client.get("workspace") or {}).get("id", 0),
+        )
+        for client in clients
+    }
+    monitor_workspaces = (data.get("focus") or {}).get("monitorWorkspaces") or []
+    terminal_clients = [client for client in clients if (client.get("command") or {}).get("terminal")]
+    terminal_sessions = [
+        client for client in terminal_clients
+        if (client.get("command") or {}).get("session")
+    ]
+    print(json.dumps({
+        "saved": True,
+        "count": len(data["clients"]),
+        "workspaceCount": len(workspace_keys),
+        "monitorCount": len(monitor_workspaces),
+        "terminalCount": len(terminal_clients),
+        "terminalSessionCount": len(terminal_sessions),
+        "path": str(LAST_FILE),
+    }))
+    # Build notification with details
+    notify_summary = f"Session saved: {len(data['clients'])} windows"
+    notify_parts = [f"{len(workspace_keys)} workspaces"]
+    if len(monitor_workspaces) > 1:
+        notify_parts.append(f"{len(monitor_workspaces)} monitors")
+    if terminal_clients:
+        term_info = f"{len(terminal_clients)} terminals"
+        if terminal_sessions:
+            term_info += f", {len(terminal_sessions)} sessions"
+        notify_parts.append(term_info)
+    notify_body = " · ".join(notify_parts)
+    _notify(notify_summary, notify_body)
+    return data
+
+
+def _snapshot_is_recent(max_age=15):
+    """Return True if last.json was written within the last max_age seconds.
+    the UI just performed moments before the session teardown."""
+    try:
+        mtime = LAST_FILE.stat().st_mtime
+    except (OSError, FileNotFoundError):
+        return False
+    return (time.time() - mtime) < max_age
+def _snapshot_is_rolling():
+    try:
+        data = json.loads(LAST_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("rolling") is True
+
+
+def _compositor_is_reachable():
+    if not _hypr_available():
+        return True
+    try:
+        run_json("hyprctl", "-j", "clients")
+    except Exception:
+        return False
+    return True
+
+
+
+def _arm_restore(saved_at):
+    AUTO_RESTORE_FILE.write_text(
+        json.dumps({"armed": True, "savedAt": saved_at}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _disarm_restore():
+    try:
+        AUTO_RESTORE_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def save_requested():
+    """Write the save-requested flag. Called by the UI checkbox path before
+    the system action runs, so the systemd/logout fallback knows the user
+    opted into restore and may arm the marker even when its own save() finds
+    the compositor already gone."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    SAVE_REQUESTED_FILE.write_text(str(int(time.time())), encoding="utf-8")
+
+
+def _consume_save_requested():
+    """Return True if the save-requested flag was present, removing it."""
+    if SAVE_REQUESTED_FILE.exists():
+        try:
+            SAVE_REQUESTED_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        return True
+    return False
+
+
+def save_auto_if_stale(save_requested_flag=False):
+    """Save and arm auto-restore, but only if last.json is stale (not written
+    in the last 15 seconds). This prevents the systemd fallback from
+    overwriting a fresh save-auto the UI already did on its own shutdown path.
+
+    The fallback (systemd ExecStop, logout script) is gated on the
+    save-requested flag: it only arms restore when the user checked the
+    "save current session" box. Without that flag, an empty save (compositor
+    gone, or all windows closed) disarms the marker instead of arming a
+    stale restore — matching the design doc and the user contract."""
+    requested = save_requested_flag or SAVE_REQUESTED_FILE.exists()
+    _consume_save_requested()
+    if _snapshot_is_recent() and AUTO_RESTORE_FILE.exists():
+        # UI already saved + armed. Nothing to do.
+        print(json.dumps({"saved": False, "skipped": True, "reason": "recent", "armed": True}))
+        return None
+    if _snapshot_is_recent() and _snapshot_is_rolling() and not _compositor_is_reachable():
+        # The rolling timer may have written the snapshot immediately before
+        # teardown. Preserve it for the next login instead of treating the
+        # recent mtime as proof that the compositor is still alive.
+        _arm_restore(int(LAST_FILE.stat().st_mtime))
+        print(json.dumps({"saved": False, "skipped": True, "reason": "compositor-gone", "armed": True}))
+        return None
+    if _snapshot_is_recent():
+        # UI saved but didn't arm (save without save-auto). Arm restore only
+        # when the user requested it.
+        if requested:
+            _arm_restore(int(LAST_FILE.stat().st_mtime))
+        else:
+            _disarm_restore()
+        print(json.dumps({"saved": False, "skipped": True, "reason": "recent", "armed": requested}))
+        return None
+    return save_auto(requested=requested)
+
+
+def save_auto(requested=True):
+    """Save a snapshot and arm auto-restore. When `requested` is False (the
+    fallback path with no save-requested flag), an empty save disarms the
+    marker instead of arming a restore for a desktop the user did not ask to
+    save. A non-empty save still arms: a snapshot with real windows is always
+    worth restoring when the marker is already armed."""
+    try:
+        data = save()
+    except CompositorGone:
+        # The compositor died before we could snapshot it — a suspend/resume
+        # crash, a fast poweroff, a Hyprland crash. This is never a user
+        # opt-out (opt-outs go through the UI path while the compositor is
+        # still alive and hit the empty-save disarm below), so arm restore
+        # whenever the rolling save left a snapshot with real windows in it,
+        # regardless of the save-requested flag. The recurring bug was that
+        # this path crashed and left neither snapshot nor marker; the rolling
+        # timer keeps the snapshot fresh, and this arm makes the next session
+        # actually use it.
+        if LAST_FILE.exists() and _existing_client_count() > 0:
+            _arm_restore(int(LAST_FILE.stat().st_mtime))
+            print(json.dumps({"saved": False, "skipped": True, "reason": "compositor-gone", "armed": True}))
+        else:
+            _disarm_restore()
+            print(json.dumps({"saved": False, "skipped": True, "reason": "compositor-gone", "armed": False}))
+        return None
+    if not data:
+        # Empty save: no clients captured. On Hyprland this means the
+        # compositor was already gone or all windows were closed, so disarming
+        # the marker is correct (do not arm a stale restore — design doc).
+        # On a non-Hyprland compositor (labwc) snapshot_clients() cannot reach
+        # hyprctl, so an empty result is a false negative, not proof of an
+        # empty desktop: preserve the existing marker instead of disarming,
+        # so a snapshot armed by a prior Hyprland session survives a labwc
+        # interlude and still restores on the next Hyprland start.
+        if _hypr_available():
+            _disarm_restore()
+        return None
+
+    _arm_restore(data.get("savedAt", int(time.time())))
+    return data
+
+
+_ROLLING_FP_FIELDS = (
+    # Layout-relevant fields only. Title/initialTitle carry live counters
+    # (terminal PIDs, tab names) and focusHistoryID is a global monotonic
+    # counter — all three churn without any restorable change, which would
+    # make the rolling save rewrite last.json on every timer tick.
+    "class", "initialClass", "workspace",
+    "monitorName", "atRelative", "size", "floating", "fullscreen",
+    "command",
+)
+
+
+def _client_fingerprint(client):
+    return json.dumps(
+        {k: client.get(k) for k in _ROLLING_FP_FIELDS},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+def _restore_in_progress():
+    """True if a session restore is running (a live PID holds the restore
+    lock). Used by the rolling save to avoid snapshotting a half-restored
+    desktop and overwriting the snapshot currently being restored."""
+    try:
+        if not RESTORE_LOCK.exists():
+            return False
+        pid = int(RESTORE_LOCK.read_text().strip())
+        return pid > 0 and Path(f"/proc/{pid}").exists()
+    except Exception:
+        return False
+
+
+
+def save_rolling():
+    """Silent periodic snapshot for the rolling-save timer. Writes last.json
+    only when the restorable window set actually changed, never touches the
+    restore marker, and prints nothing so it can run every few minutes.
+
+    This is what makes auto-restore immune to teardown races: when logind
+    kills the compositor before the ExecStop snapshot can run, last.json is
+    at most one timer interval old instead of one session old."""
+    if _restore_in_progress():
+        # A restore is mid-flight: snapshotting now would capture a
+        # half-restored desktop and overwrite the snapshot being restored.
+        return
+    if _snapshot_is_recent():
+        # The UI or the teardown path wrote a snapshot moments ago.
+        return
+    try:
+        clients = snapshot_clients()
+    except CompositorGone:
+        # Stale signature from a dead compositor (session switch, teardown).
+        return
+    if not clients:
+        return
+    try:
+        existing = json.loads(LAST_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        existing = None
+    old = existing.get("clients") if isinstance(existing, dict) else None
+    if old:
+        if sorted(_client_fingerprint(c) for c in old) == \
+                sorted(_client_fingerprint(c) for c in clients):
+            # Unchanged desktop — preserve last.json mtime so staleness
+            # checks keep meaning what they say.
+            return
+    if LAST_FILE.exists():
+        try:
+            shutil.copy2(LAST_FILE, LAST_BAK_FILE)
+        except Exception:
+            pass
+    _atomic_write_json(LAST_FILE, {
+        "version": 1,
+        "savedAt": int(time.time()),
+        "focus": current_focus_state(clients),
+        "clients": clients,
+        "rolling": True,
+    })
+
+
+def write_kitty_session_file(record, index):
+    session = record.get("command", {}).get("session") or {}
+    if session.get("type") != "kitty":
+        return ""
+    content = kitty_restore_session(session)
+    if not content.strip():
+        return ""
+    KITTY_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    path = KITTY_SESSION_DIR / f"restore-{index}.session"
+    path.write_text(content, encoding="utf-8")
+    return str(path)
+
+
+def preview_session(session):
+    if not session:
+        return None
+    result = {
+        "type": session.get("type", ""),
+        "name": session.get("name", ""),
+    }
+    if session.get("type") == "kitty":
+        result["name"] = "kitty session"
+    return result
+
+
+def preview_program(program):
+    if not program:
+        return None
+    return {
+        "name": program.get("name", ""),
+        "cwd": program.get("cwd", ""),
+        "argv": program.get("argv", []),
+    }
+
+
+def preview_from_data(clients, focus):
+    groups = {}
+    for client in clients:
+        workspace = client.get("workspace") or {}
+        wsid = workspace.get("id", 0)
+        key = str(wsid)
+        if key not in groups:
+            groups[key] = {
+                "id": wsid,
+                "name": workspace.get("name", str(wsid)),
+                "monitor": client.get("monitor", -1),
+                "monitorName": client.get("monitorName", ""),
+                "clients": [],
+            }
+        groups[key]["clients"].append({
+            "class": client.get("class", ""),
+            "title": client.get("title", ""),
+            "monitor": client.get("monitor", -1),
+            "floating": client.get("floating", False),
+            "fullscreen": client.get("fullscreen", 0),
+            "cwd": client.get("command", {}).get("cwd", ""),
+            "argv": client.get("command", {}).get("argv", []),
+            "session": preview_session(client.get("command", {}).get("session")),
+            "program": preview_program(client.get("command", {}).get("program")),
+        })
+
+    workspaces = sorted(groups.values(), key=lambda item: (item.get("id", 0), item.get("monitor", -1)))
+    print(json.dumps({
+        "version": 1,
+        "count": len(clients),
+        "workspaceCount": len(workspaces),
+        "focus": focus,
+        "workspaces": workspaces,
+    }, ensure_ascii=False))
+
+
+def preview():
+    """Live preview — collects current state. Used by the confirmation popup
+    before save-close to show what will be snapshotted."""
+    clients = snapshot_clients()
+    focus = current_focus_state(clients)
+    preview_from_data(clients, focus)
+
+
+def preview_saved():
+    """Read from last.json without re-collecting. Much faster than preview()
+    when the snapshot already exists."""
+    if not LAST_FILE.exists():
+        print(json.dumps({"version": 1, "count": 0, "workspaceCount": 0, "workspaces": []}))
+        return
+    try:
+        data = json.loads(LAST_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        print(json.dumps({"version": 1, "count": 0, "workspaceCount": 0, "workspaces": []}))
+        return
+    clients = data.get("clients", [])
+    focus = data.get("focus", {})
+    preview_from_data(clients, focus)
+
+
+def close_snapshot(data):
+    records = list(data.get("clients", []))
+    records.sort(key=lambda c: (
+        c.get("workspace", {}).get("id", 0),
+        c.get("focusHistoryID", 999999),
+    ))
+    remaining = []
+    for client in records:
+        address = client.get("address")
+        if not address:
+            continue
+        if address not in hypr_clients_by_address():
+            continue
+        # Try direct close first (no workspace switch). hypr_close_window
+        # has a fallback that focuses the window and retries if the first
+        # attempt fails, so we avoid unnecessary workspace switching that
+        # causes visible flicker on multi-monitor setups.
+        hypr_close_window(address)
+        if not wait_until_client_gone(address, timeout=1.0):
+            # Direct close failed — the window may need focus first.
+            workspace = client.get("workspace") or {}
+            hypr_focus_workspace(workspace.get("id", 0))
+            time.sleep(0.12)
+            hypr_close_window(address)
+            if not wait_until_client_gone(address, timeout=1.5):
+                remaining.append({"address": address, "class": client.get("class", "")})
+
+    if remaining:
+        print(json.dumps({
+            "closed": len(records) - len(remaining),
+            "remaining": len(remaining),
+            "remainingClients": remaining,
+        }), file=sys.stderr)
+
+
+def status():
+    if not LAST_FILE.exists():
+        print(json.dumps({
+            "saved": False,
+            "autoRestore": AUTO_RESTORE_FILE.exists(),
+            "count": 0,
+            "path": str(LAST_FILE),
+        }))
+        return
+    try:
+        data = json.loads(LAST_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        print(json.dumps({
+            "saved": False,
+            "autoRestore": AUTO_RESTORE_FILE.exists(),
+            "count": 0,
+            "path": str(LAST_FILE),
+            "error": "invalid",
+        }))
+        return
+    monitor_workspaces = (data.get("focus") or {}).get("monitorWorkspaces") or []
+    print(json.dumps({
+        "saved": True,
+        "autoRestore": AUTO_RESTORE_FILE.exists(),
+        "count": len(data.get("clients", [])),
+        "monitorCount": len(monitor_workspaces),
+        "savedAt": data.get("savedAt", 0),
+        "path": str(LAST_FILE),
+    }))
+
+
+def client_matches(client, record):
+    cls = (client.get("initialClass") or client.get("class") or "").lower()
+    rec_cls = (record.get("initialClass") or record.get("class") or "").lower()
+    cls_match = False
+    if rec_cls and cls == rec_cls:
+        cls_match = True
+    else:
+        cls2 = (client.get("class") or "").lower()
+        rec_cls2 = (record.get("class") or "").lower()
+        if rec_cls2 and cls2 == rec_cls2:
+            cls_match = True
+    if not cls_match:
+        return False
+
+    # Dynamic titles distinguish terminal windows. Their initialTitle is
+    # normally just "kitty"/"foot", so preferring it makes every window of
+    # the same terminal class match every saved record.
+    rec_title = (record.get("title") or record.get("initialTitle") or "").strip()
+    if not rec_title:
+        return True
+    cli_title = (client.get("title") or client.get("initialTitle") or "").strip()
+    if not cli_title:
+        # New window hasn't set its title yet — accept on class match alone,
+        # but only if no other record with the same class has a stronger
+        # title match (handled by the caller via known_addresses tracking).
+        return True
+    # Substring match in both directions to handle title changes during
+    # application startup (e.g. "Mozilla Firefox" -> "Page — Mozilla Firefox").
+    return rec_title.lower() in cli_title.lower() or cli_title.lower() in rec_title.lower()
+
+
+def process_belongs_to(pid, launched_pid):
+    """Return True when pid is the launched process or one of its children."""
+    try:
+        pid = int(pid or 0)
+        launched_pid = int(launched_pid or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or launched_pid <= 0:
+        return False
+    if pid == launched_pid:
+        return True
+
+    seen = set()
+    current = pid
+    while current > 1 and current not in seen:
+        seen.add(current)
+        try:
+            status = Path(f"/proc/{current}/status").read_text(encoding="utf-8")
+            parent_line = next(line for line in status.splitlines() if line.startswith("PPid:"))
+            current = int(parent_line.split(":", 1)[1].strip())
+        except (OSError, StopIteration, ValueError):
+            return False
+        if current == launched_pid:
+            return True
+    return False
+
+
+def title_match_score(client, record):
+    """Rank a restored Firefox window against one saved window record."""
+    record_title = (record.get("title") or record.get("initialTitle") or "").strip().lower()
+    client_title = (client.get("title") or client.get("initialTitle") or "").strip().lower()
+    if not record_title or not client_title:
+        return 1
+    if record_title == client_title:
+        return 1000
+    if record_title in client_title or client_title in record_title:
+        return 500 + min(len(record_title), len(client_title))
+
+    record_parts = {part for part in record_title.replace("—", " ").split() if len(part) > 2}
+    client_parts = {part for part in client_title.replace("—", " ").split() if len(part) > 2}
+    return len(record_parts & client_parts)
+
+
+def collect_firefox_clients(known_addresses, existing, expected, timeout=24.0):
+    """Wait for Firefox's own session restore to recreate its windows.
+
+    Firefox restores all windows from one process launch. Starting it once per
+    saved Hyprland window duplicates the entire browser session.
+    """
+    candidates = {client.get("address"): client for client in existing if client.get("address")}
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        try:
+            clients = run_json("hyprctl", "-j", "clients")
+        except Exception:
+            time.sleep(0.15)
+            continue
+        for client in clients:
+            address = client.get("address")
+            if not address or not is_firefox(client):
+                continue
+            if address in known_addresses and address not in candidates:
+                continue
+            candidates[address] = client
+
+        if len(candidates) >= expected:
+            break
+        time.sleep(0.15)
+
+    return list(candidates.values())
+
+
+def firefox_launcher():
+    """Return a normal launcher, never Firefox's internal executable."""
+    candidates = [Path("/usr/bin/firefox"), Path.home() / ".local/bin/firefox"]
+    resolved = shutil.which("firefox")
+    if resolved:
+        candidates.append(Path(resolved))
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return ""
+
+
+def firefox_monitor_scale(record):
+    monitor_name = record.get("monitorName", "")
+    try:
+        monitors = run_json("hyprctl", "-j", "monitors")
+    except Exception:
+        monitors = []
+    monitor = next((item for item in monitors if item.get("name") == monitor_name), None)
+    if monitor is None:
+        monitor = next(
+            (item for item in monitors if str(item.get("name", "")).startswith("eDP")),
+            monitors[0] if monitors else None,
+        )
+    try:
+        return max(1, int(float((monitor or {}).get("scale", 1)) + 0.5))
+    except (TypeError, ValueError):
+        return 1
+
+
+def firefox_launch_environment(record):
+    """Restore Firefox's graphics environment without copying secrets.
+
+    The current desktop environment is authoritative because monitor scaling
+    may have changed since the snapshot was saved. Snapshot values are only a
+    fallback for cold-start environments that are missing those variables.
+    """
+    env = os.environ.copy()
+    saved = record.get("command", {}).get("environment") or {}
+    env["MOZ_ENABLE_WAYLAND"] = str(
+        env.get("MOZ_ENABLE_WAYLAND") or saved.get("MOZ_ENABLE_WAYLAND") or "1"
+    )
+    env["GDK_BACKEND"] = str(
+        env.get("GDK_BACKEND") or saved.get("GDK_BACKEND") or "wayland,x11,*"
+    )
+    env["GDK_SCALE"] = str(
+        env.get("GDK_SCALE") or saved.get("GDK_SCALE") or firefox_monitor_scale(record)
+    )
+
+    # Firefox already consumes the output scale. Forcing 0.5 on a 2x display
+    # makes a restored browser smaller than one launched from the desktop.
+    # Ignore a saved value here: snapshots produced by the previous restore
+    # implementation may contain its synthetic 0.5 and would otherwise keep
+    # poisoning later sessions. An explicit value in the current desktop
+    # environment is still respected.
+    dpi_scale = env.get("GDK_DPI_SCALE")
+    if dpi_scale:
+        env["GDK_DPI_SCALE"] = str(dpi_scale)
+    else:
+        env.pop("GDK_DPI_SCALE", None)
+
+    cursor_size = env.get("XCURSOR_SIZE") or saved.get("XCURSOR_SIZE")
+    if cursor_size:
+        env["XCURSOR_SIZE"] = str(cursor_size)
+    return env
+
+
+def restore_firefox_records(records, known_addresses, ws_to_monitor, restored_addresses):
+    if not records:
+        return 0
+
+    current_clients = run_json("hyprctl", "-j", "clients")
+    existing = [client for client in current_clients if is_firefox(client)]
+    if not existing:
+        leader = sorted(records, key=lambda item: item.get("focusHistoryID", 999999))[0]
+        workspace = leader.get("workspace") or {}
+        wsid = workspace.get("id", 0)
+        monitor_name = leader.get("monitorName") or ws_to_monitor.get(wsid, "")
+        if monitor_name:
+            hypr_lua(f'hl.dsp.focus({{ monitor = "{monitor_name}" }})')
+            time.sleep(0.06)
+        if isinstance(wsid, int) and wsid > 0:
+            hypr_focus_workspace(wsid)
+            time.sleep(0.12)
+
+        executable = firefox_launcher()
+        if not executable:
+            print("Firefox executable is unavailable", file=sys.stderr)
+            return 0
+        try:
+            # Hyprland records Firefox's final /usr/lib*/firefox/firefox
+            # process. Starting that path directly bypasses the distribution
+            # wrapper's remoting setup and the normal desktop scale environment.
+            subprocess.Popen(
+                [executable],
+                env=firefox_launch_environment(leader),
+                start_new_session=True,
+            )
+        except Exception as err:
+            print(f"Failed to launch Firefox: {err}", file=sys.stderr)
+            return 0
+
+    candidates = collect_firefox_clients(known_addresses, existing, len(records))
+    for client in candidates:
+        address = client.get("address")
+        if address:
+            known_addresses.add(address)
+
+    unmatched = list(candidates)
+    restored = 0
+    for record in sorted(records, key=lambda item: item.get("focusHistoryID", 999999)):
+        if not unmatched:
+            break
+        client = max(unmatched, key=lambda item: title_match_score(item, record))
+        unmatched.remove(client)
+        address = client.get("address", "")
+        restored_addresses[record.get("address", "")] = address
+        place_client(client, record)
+        restored += 1
+
+    if restored < len(records):
+        print(
+            f"Firefox restored {restored} of {len(records)} saved windows; "
+            "the remaining windows were not duplicated with extra launches",
+            file=sys.stderr,
+        )
+    return restored
+
+
+def _single_instance_launcher(cls):
+    """Return a normal launcher for a single-instance application class.
+    Like firefox_launcher, never use the internal binary path that Hyprland
+    records."""
+    # Strip org.kde. prefix to get the desktop binary name.
+    binary = cls.split(".")[-1] if "." in cls else cls
+    resolved = shutil.which(binary) or shutil.which(cls)
+    if resolved:
+        return resolved
+    return ""
+
+
+def collect_single_instance_clients(cls, known_addresses, existing, expected, timeout=18.0):
+    """Wait for a single-instance app to recreate its windows from one launch."""
+    candidates = {client.get("address"): client for client in existing if client.get("address")}
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            clients = run_json("hyprctl", "-j", "clients")
+        except Exception:
+            time.sleep(0.15)
+            continue
+        for client in clients:
+            address = client.get("address")
+            if not address or address in known_addresses:
+                continue
+            client_cls = (client.get("initialClass") or client.get("class") or "").lower()
+            if client_cls == cls or client_cls.endswith("." + cls):
+                candidates[address] = client
+        if len(candidates) >= expected:
+            break
+        time.sleep(0.15)
+    return list(candidates.values())
+
+
+def restore_single_instance_records(records, known_addresses, ws_to_monitor, restored_addresses):
+    """Restore single-instance apps (Dolphin, KWrite, etc.) with a single
+    launch per class, then match recreated windows to saved records by title."""
+    if not records:
+        return 0
+    restored = 0
+    # Group by class so each app class is launched once.
+    by_class = {}
+    for record in records:
+        cls = window_class(record)
+        by_class.setdefault(cls, []).append(record)
+
+    for cls, class_records in by_class.items():
+        current_clients = run_json("hyprctl", "-j", "clients")
+        existing = [c for c in current_clients if window_class(c) == cls]
+        if not existing:
+            leader = sorted(class_records, key=lambda item: item.get("focusHistoryID", 999999))[0]
+            workspace = leader.get("workspace") or {}
+            wsid = workspace.get("id", 0)
+            monitor_name = leader.get("monitorName") or ws_to_monitor.get(wsid, "")
+            if monitor_name:
+                hypr_lua(f'hl.dsp.focus({{ monitor = "{monitor_name}" }})')
+                time.sleep(0.06)
+            if isinstance(wsid, int) and wsid > 0:
+                hypr_focus_workspace(wsid)
+                time.sleep(0.12)
+            executable = _single_instance_launcher(cls)
+            if not executable:
+                print(f"Single-instance app {cls} executable is unavailable", file=sys.stderr)
+                continue
+            try:
+                subprocess.Popen([executable], start_new_session=True)
+            except Exception as err:
+                print(f"Failed to launch {cls}: {err}", file=sys.stderr)
+                continue
+
+        timeout = RESTORE_TIMEOUTS.get(cls, 12.0)
+        candidates = collect_single_instance_clients(cls, known_addresses, existing, len(class_records), timeout=timeout)
+        for client in candidates:
+            address = client.get("address")
+            if address:
+                known_addresses.add(address)
+
+        unmatched = list(candidates)
+        for record in sorted(class_records, key=lambda item: item.get("focusHistoryID", 999999)):
+            if not unmatched:
+                break
+            client = max(unmatched, key=lambda item: title_match_score(item, record))
+            unmatched.remove(client)
+            address = client.get("address", "")
+            restored_addresses[record.get("address", "")] = address
+            place_client(client, record)
+            restored += 1
+
+        if restored < len(class_records):
+            print(
+                f"{cls} restored {restored} of {len(class_records)} saved windows; "
+                "the remaining windows were not duplicated with extra launches",
+                file=sys.stderr,
+            )
+    return restored
+
+
+def _result_entry(record, reason=""):
+    """Build a compact result entry for restore-result.json."""
+    return {
+        "class": record.get("class") or record.get("initialClass") or "",
+        "title": (record.get("title") or record.get("initialTitle") or "")[:80],
+        "workspace": (record.get("workspace") or {}).get("name", ""),
+        "reason": reason,
+    }
+
+
+def _write_restore_result(restored, total, results):
+    """Persist the restore outcome so the overlay can report N/M windows."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "restored": restored,
+            "total": total,
+            "failed": results.get("failed", []),
+            "skipped": results.get("skipped", []),
+            "timestamp": int(time.time()),
+        }
+        RESTORE_RESULT_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def wait_for_client(record, known_addresses, launched_pid=0, timeout=5.0):
+    if not _hypr_available():
+        # Non-Hyprland compositor (labwc): there is no hyprctl to verify
+        # the launch against. Popen already succeeded, so treat the launch
+        # as restored; place_client() becomes a no-op for the empty address.
+        return {"address": "", "workspace": {}, "pid": launched_pid}
+    deadline = time.time() + timeout
+    fallback = None
+    fallback_since = 0.0
+    while time.time() < deadline:
+        try:
+            clients = run_json("hyprctl", "-j", "clients")
+        except Exception:
+            time.sleep(0.2)
+            continue
+        for client in clients:
+            address = client.get("address")
+            if not address or address in known_addresses:
+                continue
+            if process_belongs_to(client.get("pid"), launched_pid):
+                known_addresses.add(address)
+                return client
+            if client_matches(client, record):
+                if fallback is None or fallback.get("address") != address:
+                    fallback = client
+                    fallback_since = time.time()
+        # Give the compositor and application a short window to expose the
+        # PID belonging to this exact launch. Falling back immediately to a
+        # same-class terminal can assign one Kitty window to another record.
+        if fallback is not None and time.time() - fallback_since >= 0.6:
+            address = fallback.get("address")
+            known_addresses.add(address)
+            return fallback
+        time.sleep(0.12)
+    return None
+
+
+def workspace_target(workspace):
+    """Return the Hyprland dispatcher target for a saved workspace."""
+    workspace = workspace or {}
+    wsid = workspace.get("id")
+    name = workspace.get("name", "")
+    if isinstance(wsid, int) and wsid < 0:
+        return name if name.startswith("special:") else "special"
+    return str(wsid) if wsid else ""
+
+
+def move_client_to_workspace(address, workspace):
+    """Move a restored client and verify that Hyprland applied the move."""
+    target = workspace_target(workspace)
+    target_id = (workspace or {}).get("id")
+    if not address or not target:
+        return False
+
+    # Omarchy's Lua dispatcher selects a client through `window`. Using an
+    # `address` field silently leaves the client on its launch workspace.
+    hypr_lua(
+        f'hl.dsp.window.move({{ workspace = {json.dumps(target)}, '
+        f'follow = false, window = "address:{address}" }})'
+    )
+
+    deadline = time.time() + 0.8
+    while time.time() < deadline:
+        client = hypr_clients_by_address().get(address) or {}
+        if (client.get("workspace") or {}).get("id") == target_id:
+            return True
+        time.sleep(0.08)
+
+    # Lua fallback (the native dispatcher name is a syntax error on the
+    # Hyprland 0.55+ Lua dispatch backend). window.move accepts a workspace
+    # selector (verified live); workspace.move needs a monitor.
+    hypr_lua(
+        f'hl.dsp.window.move({{ workspace = {json.dumps(target)}, '
+        f'window = "address:{address}" }})'
+    )
+    deadline = time.time() + 0.8
+    while time.time() < deadline:
+        client = hypr_clients_by_address().get(address) or {}
+        if (client.get("workspace") or {}).get("id") == target_id:
+            return True
+        time.sleep(0.08)
+    return False
+
+
+def place_client(client, record):
+    address = client.get("address")
+    if not address:
+        return
+    workspace = record.get("workspace") or {}
+    wsid = workspace.get("id")
+    # Only move the window if it is not already on the target workspace.
+    # Since we switched to the target workspace before launching, the window
+    # should already be there — the move is a safety net for race conditions.
+    client_wsid = (client.get("workspace") or {}).get("id")
+    if wsid and client_wsid != wsid:
+        if not move_client_to_workspace(address, workspace):
+            print(
+                f"Failed to move restored client {address} to workspace "
+                f"{workspace_target(workspace)}",
+                file=sys.stderr,
+            )
+    if record.get("floating"):
+        hypr_lua(f'hl.dsp.window.float({{ window = "address:{address}", action = "set" }})')
+        size = record.get("size") or []
+        at = record.get("at") or []
+        at_relative = record.get("atRelative") or []
+        # Use relative coordinates when available so floating windows land
+        # in the correct position even if monitor layout changed since the
+        # snapshot was taken. Fall back to absolute coordinates for older
+        # snapshots that lack atRelative.
+        if len(at_relative) == 2:
+            mon_name = record.get("monitorName", "")
+            if mon_name:
+                try:
+                    monitors = run_json("hyprctl", "-j", "monitors")
+                    mon = next((m for m in monitors if m.get("name") == mon_name), None)
+                    if mon:
+                        at = [at_relative[0] + mon.get("x", 0), at_relative[1] + mon.get("y", 0)]
+                except Exception:
+                    pass
+        # Hyprland 0.55+ parses `hyprctl dispatch` args as Lua — native
+        # dispatcher names (resizewindowpixel / movewindowpixel) are syntax
+        # errors there. Verified live: window.resize/move take x/y ints;
+        # fullscreen takes mode (not the legacy 0/1 int).
+        if len(size) == 2:
+            hypr_lua(
+                f'hl.dsp.window.resize({{ window = "address:{address}", '
+                f'x = {int(size[0])}, y = {int(size[1])} }})'
+            )
+        if len(at) == 2:
+            hypr_lua(
+                f'hl.dsp.window.move({{ window = "address:{address}", '
+                f'x = {int(at[0])}, y = {int(at[1])} }})'
+            )
+    if int(record.get("fullscreen") or 0) > 0:
+        hypr_lua(f'hl.dsp.focus({{ window = "address:{address}" }})')
+        hypr_lua(f'hl.dsp.window.fullscreen({{ window = "address:{address}", mode = "fullscreen" }})')
+
+
+
+def restore_focus(data, restored_addresses):
+    focus = data.get("focus") or {}
+
+    # First restore each monitor to the workspace it was showing when the
+    # snapshot was taken. This keeps multi-monitor restore from ending on the
+    # last workspace in the launch loop.
+    for monitor in focus.get("monitorWorkspaces", []):
+        monitor_name = monitor.get("name", "")
+        wsid = (monitor.get("activeWorkspace") or {}).get("id", 0)
+        if not monitor_name or not wsid:
+            continue
+        hypr_lua(f'hl.dsp.focus({{ monitor = "{monitor_name}" }})')
+        time.sleep(0.06)
+        hypr_focus_workspace(wsid)
+        time.sleep(0.06)
+
+    focused_record = focus.get("focusedRecord") or {}
+    old_address = focused_record.get("address", "")
+    new_address = restored_addresses.get(old_address, "")
+    if not new_address:
+        # Backward compatibility for older snapshots that do not have focus
+        # metadata: use the saved record with the smallest focusHistoryID.
+        records = data.get("clients", [])
+        if records:
+            target = sorted(records, key=lambda c: c.get("focusHistoryID", 999999))[0]
+            new_address = restored_addresses.get(target.get("address", ""), "")
+            focused_record = target
+
+    # Focus the monitor that had the active window, then its workspace.
+    focused_monitor_name = focused_record.get("monitorName", "")
+    if not focused_monitor_name and focused_record.get("monitor", -1) >= 0:
+        try:
+            monitors = run_json("hyprctl", "-j", "monitors")
+            midx = focused_record.get("monitor", -1)
+            if 0 <= midx < len(monitors):
+                focused_monitor_name = monitors[midx].get("name", "")
+        except Exception:
+            pass
+    if focused_monitor_name:
+        hypr_lua(f'hl.dsp.focus({{ monitor = "{focused_monitor_name}" }})')
+        time.sleep(0.06)
+
+    wsid = (focused_record.get("workspace") or {}).get("id", 0)
+    hypr_focus_workspace(wsid)
+    if new_address:
+        hypr_lua(f'hl.dsp.focus({{ window = "address:{new_address}" }})')
+
+
+SNAPSHOT_VERSION = 1
+
+
+def acquire_restore_lock():
+    """Prevent concurrent restore operations. Returns True if the lock was
+    acquired, False if another restore is already running."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        # Check if a locked PID is still alive.
+        if RESTORE_LOCK.exists():
+            try:
+                pid = int(RESTORE_LOCK.read_text().strip())
+                if pid > 0 and Path(f"/proc/{pid}").exists():
+                    return False
+            except Exception:
+                pass
+        RESTORE_LOCK.write_text(str(os.getpid()), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def release_restore_lock():
+    try:
+        # Only remove if it contains our PID.
+        if RESTORE_LOCK.exists():
+            pid = int(RESTORE_LOCK.read_text().strip())
+            if pid == os.getpid():
+                RESTORE_LOCK.unlink()
+    except Exception:
+        pass
+
+
+def load_snapshot():
+    """Load and validate the snapshot file. Falls back to the .bak backup if
+    the primary file is missing, unreadable, or not valid JSON."""
+    for candidate in (LAST_FILE, LAST_BAK_FILE):
+        if not candidate.exists():
+            continue
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        version = data.get("version", 0)
+        if version > SNAPSHOT_VERSION:
+            print(f"Snapshot version {version} is newer than supported {SNAPSHOT_VERSION}, skipping restore", file=sys.stderr)
+            return None
+        if candidate != LAST_FILE:
+            print(f"Primary snapshot was invalid; restored from {candidate.name}", file=sys.stderr)
+        return data
+    return None
+
+
+def restore():
+    if not acquire_restore_lock():
+        print("Restore is already in progress", file=sys.stderr)
+        return 1
+    try:
+        return _restore_impl()
+    finally:
+        release_restore_lock()
+
+
+def _restore_impl():
+    data = load_snapshot()
+    if data is None:
+        print("No Omarchy session snapshot exists", file=sys.stderr)
+        return 1
+    known = {client.get("address") for client in run_json("hyprctl", "-j", "clients")}
+
+    # Build a mapping of workspace id -> monitor name from the snapshot's
+    # monitorWorkspaces and per-client monitorName field. This lets us switch
+    # the correct monitor before launching each workspace's windows.
+    focus = data.get("focus") or {}
+    monitor_workspaces = focus.get("monitorWorkspaces") or []
+    ws_to_monitor = {}
+    for mw in monitor_workspaces:
+        aws = mw.get("activeWorkspace") or {}
+        ws_to_monitor[aws.get("id", 0)] = mw.get("name", "")
+
+    # Also derive workspace -> monitor from client records as a fallback.
+    for record in data.get("clients", []):
+        wsid = (record.get("workspace") or {}).get("id", 0)
+        if wsid and wsid not in ws_to_monitor:
+            mon_name = record.get("monitorName", "")
+            if mon_name:
+                ws_to_monitor[wsid] = mon_name
+
+    # Firefox and other single-instance apps own their multi-window session.
+    # Restore them once, then map the windows they recreate back to saved
+    # Hyprland workspaces.
+    single_instance_records = [record for record in data.get("clients", []) if is_single_instance(record)]
+    firefox_records = [record for record in single_instance_records if is_firefox(record)]
+    other_single_records = [record for record in single_instance_records if not is_firefox(record)]
+
+    # Group the remaining clients by workspace, preserving sort order.
+    groups = {}
+    for record in data.get("clients", []):
+        if is_single_instance(record):
+            continue
+        wsid = (record.get("workspace") or {}).get("id", 0)
+        groups.setdefault(wsid, []).append(record)
+
+    restored = 0
+    restore_results = {"restored": [], "failed": [], "skipped": []}
+    launch_index = 0
+    restored_addresses = {}
+    for wsid, records in groups.items():
+        # Switch the correct monitor to the target workspace before launching.
+        monitor_name = ws_to_monitor.get(wsid, "")
+        if monitor_name:
+            hypr_lua(f'hl.dsp.focus({{ monitor = "{monitor_name}" }})')
+            time.sleep(0.06)
+        if isinstance(wsid, int) and wsid > 0:
+            hypr_focus_workspace(wsid)
+            time.sleep(0.12)
+        elif isinstance(wsid, int) and wsid < 0:
+            # Special workspace — toggle it on the current monitor, by name.
+            ws_name = ((records[0].get("workspace") or {}).get("name") or "") if records else ""
+            hypr_focus_workspace(wsid, ws_name or None)
+            time.sleep(0.12)
+
+        for record in records:
+            argv = restore_record_argv(record)
+            if not argv:
+                restore_results["skipped"].append(_result_entry(record, "no argv"))
+                continue
+            if "__OMARCHY_KITTY_SESSION__" in argv:
+                session_path = write_kitty_session_file(record, launch_index)
+                launch_index += 1
+                if session_path:
+                    argv = [
+                        session_path
+                        if arg == "__OMARCHY_KITTY_SESSION__"
+                        else arg
+                        for arg in argv
+                    ]
+            cwd = record.get("command", {}).get("cwd") or None
+            try:
+                process = subprocess.Popen(
+                    argv,
+                    cwd=cwd if cwd and Path(cwd).is_dir() else None,
+                    start_new_session=True,
+                )
+            except Exception as err:
+                print(f"Failed to launch {shlex.join(argv)}: {err}", file=sys.stderr)
+                restore_results["failed"].append(_result_entry(record, f"launch error: {err}"))
+                continue
+            client = wait_for_client(record, known, launched_pid=process.pid, timeout=restore_timeout_for(record))
+            if client:
+                restored_addresses[record.get("address", "")] = client.get("address", "")
+                place_client(client, record)
+                restored += 1
+                restore_results["restored"].append(_result_entry(record, "ok"))
+            else:
+                restore_results["failed"].append(_result_entry(record, "timeout"))
+    restored += restore_firefox_records(firefox_records, known, ws_to_monitor, restored_addresses)
+    restored += restore_single_instance_records(other_single_records, known, ws_to_monitor, restored_addresses)
+    restore_focus(data, restored_addresses)
+    _write_restore_result(restored, len(data.get("clients", [])), restore_results)
+    print(json.dumps({"restored": restored, "count": len(data.get("clients", []))}))
+    return 0
+
+
+def restore_auto():
+    if not AUTO_RESTORE_FILE.exists():
+        print(json.dumps({"armed": False, "restored": 0, "count": 0}))
+        return 0
+    # Run restore first, delete the marker only on success. If restore fails
+    # (hyprctl unavailable, snapshot invalid, etc.) the marker survives so
+    # the next boot can retry. restore_lock prevents concurrent runs, and a
+    # partial restore (some windows already launched) is acceptable: the
+    # retry will re-launch missing ones — better than silently losing the
+    # auto-restore on a transient failure.
+    exit_code = restore()
+    if exit_code == 0:
+        try:
+            AUTO_RESTORE_FILE.unlink()
+        except FileNotFoundError:
+            pass
+    return exit_code
+
+
+def disarm():
+    """Remove only the restore-on-next-start marker, keeping last.json so a
+    later manual restore is still possible. Used by SessionAutoRestore when
+    it skips restore (windows already open, or stale marker)."""
+    _disarm_restore()
+    print(json.dumps({"disarmed": True}))
+
+
+def clear():
+    try:
+        LAST_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        AUTO_RESTORE_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    print(json.dumps({"saved": False, "count": 0}))
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "save":
+        try:
+            save()
+        except CompositorGone as e:
+            print(json.dumps({"saved": False, "skipped": True, "reason": "compositor-gone", "error": str(e)}))
+    elif cmd in ("save-auto", "save-for-next-start"):
+        save_auto(requested=True)
+    elif cmd == "save-requested":
+        save_requested()
+    elif cmd in ("save-auto-if-stale", "save-if-stale"):
+        save_auto_if_stale()
+    elif cmd == "save-rolling":
+        save_rolling()
+    elif cmd == "preview":
+        preview()
+    elif cmd == "preview-saved":
+        preview_saved()
+    elif cmd in ("save-close", "save-and-close"):
+        data = save()
+        if data:
+            close_snapshot(data)
+    elif cmd == "restore":
+        raise SystemExit(restore())
+    elif cmd in ("restore-auto", "restore-on-next-start"):
+        raise SystemExit(restore_auto())
+    elif cmd == "disarm":
+        disarm()
+    elif cmd == "clear":
+        clear()
+    elif cmd == "status":
+        status()
+    else:
+        print("usage: omarchy-session-snapshot status|preview|preview-saved|save|save-auto|save-requested|save-auto-if-stale|save-rolling|save-close|restore|restore-auto|disarm|clear", file=sys.stderr)
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()

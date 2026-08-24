@@ -1,0 +1,12 @@
+[Unit]
+Description=Save the Omarchy desktop session snapshot on session end
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c true
+ExecStop=%h/.config/omarchy/plugins/omarchy-session-snapshot/scripts/save-on-exit
+
+[Install]
+WantedBy=graphical-session.target

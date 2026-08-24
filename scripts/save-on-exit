@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+plugin_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
+preference_file="$config_home/omarchy/session-save-on-exit"
+
+if [ -f "$preference_file" ] && [ "$(tr '[:upper:]' '[:lower:]' < "$preference_file")" = "false" ]; then
+  "$plugin_dir/bin/omarchy-session-snapshot" disarm >/dev/null 2>&1 || true
+  exit 0
+fi
+
+"$plugin_dir/bin/omarchy-session-snapshot" save-requested >/dev/null 2>&1 || true
+"$plugin_dir/bin/omarchy-session-snapshot" save-auto-if-stale >/dev/null 2>&1 || true
