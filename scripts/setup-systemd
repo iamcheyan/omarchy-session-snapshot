@@ -2,10 +2,21 @@
 set -eu
 
 plugin_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
+preference_file="$config_home/omarchy/session-save-on-exit"
+
+mkdir -p "$(dirname -- "$preference_file")"
+if [ ! -e "$preference_file" ]; then
+    printf 'true\n' > "$preference_file"
+fi
+
+"$plugin_dir/scripts/install-menu-actions"
 
 systemctl --user link "$plugin_dir/systemd/omarchy-session-snapshot-save.service" >/dev/null 2>&1 || true
 systemctl --user link "$plugin_dir/systemd/omarchy-session-snapshot-rolling.service" >/dev/null 2>&1 || true
 systemctl --user link "$plugin_dir/systemd/omarchy-session-snapshot-rolling.timer" >/dev/null 2>&1 || true
+systemctl --user link "$plugin_dir/systemd/omarchy-session-snapshot-restore.service" >/dev/null 2>&1 || true
 systemctl --user daemon-reload
 systemctl --user enable --now omarchy-session-snapshot-save.service >/dev/null
 systemctl --user enable --now omarchy-session-snapshot-rolling.timer >/dev/null
+systemctl --user enable omarchy-session-snapshot-restore.service >/dev/null

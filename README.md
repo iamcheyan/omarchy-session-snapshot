@@ -2,10 +2,21 @@
 
 ![Session Snapshot](screenshot.png)
 
-## 0.1.1
+## 0.2.0
 
-- Adapted the settings panel text, controls, borders, and hover states to
-  Omarchy popup theme tokens for readable contrast across themes.
+- Fixed the shutdown-to-login hand-off so the service stops with the graphical
+  session, arms the latest rolling snapshot even when Hyprland IPC has already
+  disappeared or reports an empty desktop after application teardown, and
+  keeps the restore marker when restoration is incomplete.
+- Use the canonical plugin-ID installation path in systemd units and persist
+  the default save-on-exit preference explicitly.
+- Restore from a dedicated graphical-session systemd service so next-login
+  recovery does not depend on the Omarchy shell or top-bar plugin running.
+- Delay the rolling timer until login restoration finishes, preventing the new
+  empty desktop from overwriting the snapshot that is about to be restored.
+- Show a non-dismissible, theme-aware center-screen overlay with live
+  application names and progress while saving before logout/reboot/shutdown
+  and while restoring after login.
 
 ## About
 
@@ -76,8 +87,9 @@ depend on another shell checkout. Snapshot data is kept under
 `~/.local/state/omarchy-session-snapshot/session/`.
 
 The plugin service installs user-level systemd links for a five-minute rolling
-snapshot and a final save when the graphical session ends. On the next login,
-the service consumes the restore marker and restores the saved session once.
+snapshot, a final save when the graphical session ends, and an independent
+next-login restore service. The restore path waits for Hyprland IPC and does
+not depend on the Omarchy shell or top bar being available.
 
 ## Remove
 

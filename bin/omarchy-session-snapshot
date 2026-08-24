@@ -722,6 +722,21 @@ def window_class(record):
     return (record.get("initialClass") or record.get("class") or "").lower()
 
 
+def app_label(record):
+    cls = record.get("class") or record.get("initialClass") or "Application"
+    known = {
+        "kitty": "Kitty", "firefox": "Firefox",
+        "org.mozilla.firefox": "Firefox", "chromium": "Chromium",
+        "google-chrome": "Google Chrome", "org.gnome.nautilus": "Files",
+        "org.kde.dolphin": "Dolphin", "code": "Visual Studio Code",
+    }
+    return known.get(str(cls).lower(), str(cls).replace("org.", "").replace("-", " ").title())
+
+
+def progress_event(event, **fields):
+    print(json.dumps({"event": event, **fields}, ensure_ascii=False), flush=True)
+
+
 def is_firefox(record):
     cls = window_class(record)
     return cls in FIREFOX_CLASSES or cls.endswith(".firefox")
@@ -1002,9 +1017,11 @@ def _existing_client_count():
     return 0
 
 
-def save():
+def save(progress=False):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     clients = snapshot_clients()
+    if progress:
+        progress_event("start", phase="saving", total=len(clients))
     if not clients:
         print(json.dumps({
             "saved": False,
@@ -1015,6 +1032,12 @@ def save():
         }))
         _notify("Session saved (empty)", "No windows to save — nothing was written")
         return None
+
+    if progress:
+        for index, client in enumerate(clients, 1):
+            progress_event("progress", phase="saving", current=index,
+                           total=len(clients), app=app_label(client),
+                           title=(client.get("title") or "")[:120])
 
     data = {
         "version": 1,
@@ -1076,7 +1099,26 @@ def save():
         notify_parts.append(term_info)
     notify_body = " · ".join(notify_parts)
     _notify(notify_summary, notify_body)
+    if progress:
+        progress_event("complete", phase="saving", current=len(clients), total=len(clients))
     return data
+
+
+def save_auto_progress():
+    try:
+        data = save(progress=True)
+    except CompositorGone:
+        data = None
+    if data:
+        _arm_restore(data.get("savedAt", int(time.time())))
+        return 0
+    if LAST_FILE.exists() and _existing_client_count() > 0:
+        total = _existing_client_count()
+        _arm_restore(int(LAST_FILE.stat().st_mtime))
+        progress_event("complete", phase="saving", current=total, total=total, fallback=True)
+        return 0
+    progress_event("error", phase="saving", message="No non-empty session snapshot is available")
+    return 1
 
 
 def _snapshot_is_recent(max_age=15):
@@ -1097,7 +1139,7 @@ def _snapshot_is_rolling():
 
 def _compositor_is_reachable():
     if not _hypr_available():
-        return True
+        return False
     try:
         run_json("hyprctl", "-j", "clients")
     except Exception:
@@ -1152,6 +1194,19 @@ def save_auto_if_stale(save_requested_flag=False):
     stale restore — matching the design doc and the user contract."""
     requested = save_requested_flag or SAVE_REQUESTED_FILE.exists()
     _consume_save_requested()
+    if requested and not _compositor_is_reachable():
+        # systemd's user manager does not necessarily retain Hyprland's IPC
+        # environment during graphical-session teardown. The rolling timer is
+        # the durable hand-off for exactly this case: arm its latest non-empty
+        # snapshot instead of treating an unreachable compositor as an empty
+        # desktop and silently losing the restore request.
+        if LAST_FILE.exists() and _existing_client_count() > 0:
+            _arm_restore(int(LAST_FILE.stat().st_mtime))
+            print(json.dumps({"saved": False, "skipped": True, "reason": "compositor-unreachable", "armed": True}))
+        else:
+            _disarm_restore()
+            print(json.dumps({"saved": False, "skipped": True, "reason": "no-existing-snapshot", "armed": False}))
+        return None
     if _snapshot_is_recent() and AUTO_RESTORE_FILE.exists():
         # UI already saved + armed. Nothing to do.
         print(json.dumps({"saved": False, "skipped": True, "reason": "recent", "armed": True}))
@@ -1201,14 +1256,19 @@ def save_auto(requested=True):
             print(json.dumps({"saved": False, "skipped": True, "reason": "compositor-gone", "armed": False}))
         return None
     if not data:
-        # Empty save: no clients captured. On Hyprland this means the
-        # compositor was already gone or all windows were closed, so disarming
-        # the marker is correct (do not arm a stale restore — design doc).
-        # On a non-Hyprland compositor (labwc) snapshot_clients() cannot reach
-        # hyprctl, so an empty result is a false negative, not proof of an
-        # empty desktop: preserve the existing marker instead of disarming,
-        # so a snapshot armed by a prior Hyprland session survives a labwc
-        # interlude and still restores on the next Hyprland start.
+        # During a real graphical-session shutdown Hyprland can still answer
+        # IPC after application scopes have already been stopped. That yields
+        # a valid-but-empty capture even though the rolling snapshot contains
+        # the desktop the user asked us to restore. A requested shutdown must
+        # therefore arm the latest non-empty snapshot instead of interpreting
+        # this teardown race as an intentionally empty desktop.
+        if requested and LAST_FILE.exists() and _existing_client_count() > 0:
+            _arm_restore(int(LAST_FILE.stat().st_mtime))
+            print(json.dumps({"saved": False, "skipped": True, "reason": "teardown-empty", "armed": True}))
+            return None
+        # An unrequested empty capture is a real opt-out path. On a
+        # non-Hyprland compositor, preserve any existing marker because the
+        # empty result is not authoritative.
         if _hypr_available():
             _disarm_restore()
         return None
@@ -2055,21 +2115,24 @@ def load_snapshot():
     return None
 
 
-def restore():
+def restore(progress=False):
     if not acquire_restore_lock():
         print("Restore is already in progress", file=sys.stderr)
         return 1
     try:
-        return _restore_impl()
+        return _restore_impl(progress=progress)
     finally:
         release_restore_lock()
 
 
-def _restore_impl():
+def _restore_impl(progress=False):
     data = load_snapshot()
     if data is None:
         print("No Omarchy session snapshot exists", file=sys.stderr)
         return 1
+    total = len(data.get("clients", []))
+    if progress:
+        progress_event("start", phase="restoring", total=total)
     known = {client.get("address") for client in run_json("hyprctl", "-j", "clients")}
 
     # Build a mapping of workspace id -> monitor name from the snapshot's
@@ -2125,6 +2188,10 @@ def _restore_impl():
             time.sleep(0.12)
 
         for record in records:
+            if progress:
+                progress_event("application", phase="restoring", current=restored,
+                               total=total, app=app_label(record),
+                               title=(record.get("title") or "")[:120])
             argv = restore_record_argv(record)
             if not argv:
                 restore_results["skipped"].append(_result_entry(record, "no argv"))
@@ -2156,17 +2223,37 @@ def _restore_impl():
                 place_client(client, record)
                 restored += 1
                 restore_results["restored"].append(_result_entry(record, "ok"))
+                if progress:
+                    progress_event("progress", phase="restoring", current=restored,
+                                   total=total, app=app_label(record))
             else:
                 restore_results["failed"].append(_result_entry(record, "timeout"))
+    if progress and firefox_records:
+        progress_event("application", phase="restoring", current=restored,
+                       total=total, app="Firefox", title="Restoring browser session")
     restored += restore_firefox_records(firefox_records, known, ws_to_monitor, restored_addresses)
+    if progress and firefox_records:
+        progress_event("progress", phase="restoring", current=restored,
+                       total=total, app="Firefox")
+    if progress and other_single_records:
+        progress_event("application", phase="restoring", current=restored,
+                       total=total, app=app_label(other_single_records[0]),
+                       title="Restoring application session")
     restored += restore_single_instance_records(other_single_records, known, ws_to_monitor, restored_addresses)
+    if progress and other_single_records:
+        progress_event("progress", phase="restoring", current=restored,
+                       total=total, app=app_label(other_single_records[-1]))
     restore_focus(data, restored_addresses)
     _write_restore_result(restored, len(data.get("clients", [])), restore_results)
-    print(json.dumps({"restored": restored, "count": len(data.get("clients", []))}))
-    return 0
+    if progress:
+        progress_event("complete" if restored >= total else "error",
+                       phase="restoring", current=restored, total=total,
+                       message="" if restored >= total else "Some applications could not be restored")
+    print(json.dumps({"restored": restored, "count": total}))
+    return 0 if restored >= total else 1
 
 
-def restore_auto():
+def restore_auto(progress=False):
     if not AUTO_RESTORE_FILE.exists():
         print(json.dumps({"armed": False, "restored": 0, "count": 0}))
         return 0
@@ -2176,7 +2263,7 @@ def restore_auto():
     # partial restore (some windows already launched) is acceptable: the
     # retry will re-launch missing ones — better than silently losing the
     # auto-restore on a transient failure.
-    exit_code = restore()
+    exit_code = restore(progress=progress)
     if exit_code == 0:
         try:
             AUTO_RESTORE_FILE.unlink()
@@ -2214,6 +2301,8 @@ def main():
             print(json.dumps({"saved": False, "skipped": True, "reason": "compositor-gone", "error": str(e)}))
     elif cmd in ("save-auto", "save-for-next-start"):
         save_auto(requested=True)
+    elif cmd == "save-auto-progress":
+        raise SystemExit(save_auto_progress())
     elif cmd == "save-requested":
         save_requested()
     elif cmd in ("save-auto-if-stale", "save-if-stale"):
@@ -2232,6 +2321,8 @@ def main():
         raise SystemExit(restore())
     elif cmd in ("restore-auto", "restore-on-next-start"):
         raise SystemExit(restore_auto())
+    elif cmd == "restore-auto-progress":
+        raise SystemExit(restore_auto(progress=True))
     elif cmd == "disarm":
         disarm()
     elif cmd == "clear":
@@ -2239,7 +2330,7 @@ def main():
     elif cmd == "status":
         status()
     else:
-        print("usage: omarchy-session-snapshot status|preview|preview-saved|save|save-auto|save-requested|save-auto-if-stale|save-rolling|save-close|restore|restore-auto|disarm|clear", file=sys.stderr)
+        print("usage: omarchy-session-snapshot status|preview|preview-saved|save|save-auto|save-auto-progress|save-requested|save-auto-if-stale|save-rolling|save-close|restore|restore-auto|restore-auto-progress|disarm|clear", file=sys.stderr)
         raise SystemExit(2)
 
 

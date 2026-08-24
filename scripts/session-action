@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+plugin_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
+preference_file="$config_home/omarchy/session-save-on-exit"
+
+commit=false
+if [ "${1:-}" = "--commit" ]; then
+    commit=true
+    shift
+fi
+action=${1:-}
+
+case "$action" in
+    logout) original=/usr/share/omarchy/bin/omarchy-system-logout ;;
+    reboot) original=/usr/share/omarchy/bin/omarchy-system-reboot ;;
+    shutdown) original=/usr/share/omarchy/bin/omarchy-system-shutdown ;;
+    *) echo "usage: session-action [--commit] logout|reboot|shutdown" >&2; exit 2 ;;
+esac
+
+if [ "$commit" = true ]; then
+    exec "$original"
+fi
+
+if [ -f "$preference_file" ] && [ "$(tr '[:upper:]' '[:lower:]' < "$preference_file")" = false ]; then
+    exec "$original"
+fi
+
+payload=$(printf '{"mode":"save","action":"%s"}' "$action")
+if omarchy-shell shell summon hancore.session-snapshot "$payload"; then
+    exit 0
+fi
+
+# Shell unavailable: retain correctness without UI rather than exiting with
+# an unarmed session.
+"$plugin_dir/bin/omarchy-session-snapshot" save-auto-progress
+exec "$original"

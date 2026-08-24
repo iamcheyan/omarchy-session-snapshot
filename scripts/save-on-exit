@@ -10,5 +10,5 @@ if [ -f "$preference_file" ] && [ "$(tr '[:upper:]' '[:lower:]' < "$preference_f
   exit 0
 fi
 
-"$plugin_dir/bin/omarchy-session-snapshot" save-requested >/dev/null 2>&1 || true
-"$plugin_dir/bin/omarchy-session-snapshot" save-auto-if-stale >/dev/null 2>&1 || true
+"$plugin_dir/bin/omarchy-session-snapshot" save-requested || true
+"$plugin_dir/bin/omarchy-session-snapshot" save-auto-if-stale || true

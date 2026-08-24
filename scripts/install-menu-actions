@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+
+
+path = Path(os.environ.get(
+    "OMARCHY_SESSION_MENU_PATH",
+    Path.home() / ".config/omarchy/extensions/omarchy-menu.jsonc",
+))
+path.parent.mkdir(parents=True, exist_ok=True)
+start = "  // hancore.session-snapshot:start"
+end = "  // hancore.session-snapshot:end"
+block = """  // hancore.session-snapshot:start
+  \"system.logout\": {\"action\":\"$HOME/.config/omarchy/plugins/hancore.session-snapshot/scripts/session-action logout\"},
+  \"system.reboot\": {\"action\":\"$HOME/.config/omarchy/plugins/hancore.session-snapshot/scripts/session-action reboot\"},
+  \"system.shutdown\": {\"action\":\"$HOME/.config/omarchy/plugins/hancore.session-snapshot/scripts/session-action shutdown\"},
+  // hancore.session-snapshot:end
+"""
+
+text = path.read_text(encoding="utf-8") if path.exists() else "{}\n"
+if start in text and end in text:
+    before, rest = text.split(start, 1)
+    _, after = rest.split(end, 1)
+    text = before + block + after.lstrip("\n")
+else:
+    closing = text.rfind("}")
+    if closing < 0:
+        raise SystemExit(f"Invalid Omarchy menu extension: {path}")
+    prefix = text[:closing].rstrip()
+    if prefix and not prefix.endswith("{") and not prefix.endswith(","):
+        prefix += ","
+    text = prefix + "\n" + block + text[closing:]
+
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text(text, encoding="utf-8")
+tmp.replace(path)

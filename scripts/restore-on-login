@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+
+plugin_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+state_home=${XDG_STATE_HOME:-"$HOME/.local/state"}
+marker="$state_home/omarchy-session-snapshot/session/restore-on-next-start"
+done_file="$state_home/omarchy-session-snapshot/session/overlay-done"
+
+[ -f "$marker" ] || exit 0
+
+# graphical-session.target may become active just before Hyprland's IPC socket
+# is ready. Wait for the compositor instead of consuming the marker too early.
+attempt=0
+while [ "$attempt" -lt 60 ]; do
+    if hyprctl -j monitors >/dev/null 2>&1; then
+        rm -f "$done_file"
+        payload=$(printf '{"mode":"restore","doneFile":"%s"}' "$done_file")
+        shell_attempt=0
+        while [ "$shell_attempt" -lt 60 ]; do
+          if omarchy-shell shell summon hancore.session-snapshot "$payload" >/dev/null 2>&1; then
+            waited=0
+            while [ "$waited" -lt 360 ]; do
+                [ -f "$done_file" ] && exit 0
+                waited=$((waited + 1))
+                sleep 0.5
+            done
+            echo "Session snapshot overlay timed out" >&2
+            exit 1
+          fi
+          shell_attempt=$((shell_attempt + 1))
+          sleep 0.5
+        done
+        # The graphical shell is optional. Restore headlessly if it cannot
+        # host the progress overlay, while retaining the marker on failure.
+        exec "$plugin_dir/bin/omarchy-session-snapshot" restore-auto-progress
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.5
+done
+
+echo "Session snapshot restore deferred: Hyprland IPC was not ready" >&2
+exit 1

@@ -1,0 +1,13 @@
+[Unit]
+Description=Restore the Omarchy desktop session snapshot on login
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.config/omarchy/plugins/hancore.session-snapshot/scripts/restore-on-login
+# Cover compositor/shell readiness waits and slow multi-application restores.
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=graphical-session.target

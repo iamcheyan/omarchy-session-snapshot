@@ -1,5 +1,7 @@
 [Unit]
 Description=Periodically refresh the Omarchy desktop session snapshot
+PartOf=graphical-session.target
+After=omarchy-session-snapshot-restore.service
 
 [Timer]
 OnBootSec=2min
